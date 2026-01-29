@@ -90,6 +90,12 @@ app.get("/health", async (req, res) => {
   }
 });
 
+app.get("/admin/accounts", (req, res) => {
+  res.json({
+    accountsConfigured: SENDGRID_ACCOUNTS.map((a) => a.id),
+  });
+});
+
 app.post("/webhooks/sendgrid/events", async (req, res) => {
   const events = req.body;
 
