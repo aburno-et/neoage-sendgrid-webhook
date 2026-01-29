@@ -132,7 +132,7 @@ async function initDb() {
   `);
 
   
-  // Ensure event_key column exists for safe upserts during rolling refresh
+  // Ensure event_key column exists for safe upserts (Email Logs refresh)
   await pool.query(`
     alter table sendgrid_events
     add column if not exists event_key text;
@@ -270,7 +270,6 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
 
       if (normalizedEvents.length === 0) {
         // Insert a single row as “log” if no event details found
-        // Insert a single row as “log” if no event details found
         const tsLog = new Date();
         const eventKey = makeEventKey({
           sgAccount: account.id,
@@ -283,97 +282,53 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
           response: detail?.response || null,
         });
 
-        await client.query(
-          `
-          insert into sendgrid_events (
-            event_key,
-            sg_account, sg_message_id, event_ts, event, ip, email, recipient_domain,
-            reason, response, status, raw
-          )
-          values (
-            $1,
-            $2, $3, $4, $5, $6, $7, $8,
-            $9, $10, $11, $12::jsonb
-          )
-          on conflict (event_key) do update
-          set
-            event_ts = excluded.event_ts,
-            reason   = excluded.reason,
-            response = excluded.response,
-            status   = excluded.status,
-            raw      = excluded.raw
-          `,
-          [
-            eventKey,
-            account.id,
-            sgMessageId,
-            ts,
-            String(eventName).toLowerCase(),
-            ip,
-            email,
-            recipientDomain,
-            reason,
-            response,
-            status,
-            JSON.stringify({ detail, ev }),
-          ]
-        );
+        const eventKey = makeEventKey({
+        sgAccount: account.id,
+        sgMessageId,
+        event: String(eventName).toLowerCase(),
+        eventTs: ts,
+        email,
+        ip,
+        status,
+        response,
+      });
+
+      await client.query(
+        `
+        insert into sendgrid_events (
+          event_key,
+          sg_account, sg_message_id, event_ts, event, ip, email, recipient_domain,
+          reason, response, status, raw
+        )
+        values (
+          $1,
+          $2, $3, $4, $5, $6, $7, $8,
+          $9, $10, $11, $12::jsonb
+        )
+        on conflict (event_key) do update
+        set
+          event_ts = excluded.event_ts,
+          reason   = excluded.reason,
+          response = excluded.response,
+          status   = excluded.status,
+          raw      = excluded.raw
+        `,
+        [
+          eventKey,
+          account.id,
+          sgMessageId,
+          ts,
+          String(eventName).toLowerCase(),
+          ip,
+          email,
+          recipientDomain,
+          reason,
+          response,
+          status,
+          JSON.stringify({ detail, ev }),
+        ]
+      );
 inserted += 1;
-        continue;
-      }
-
-      for (const ev of normalizedEvents) {
-        // Try to derive event name + timestamp (varies by API response)
-        const eventName =
-          ev?.event || ev?.type || ev?.name || detail?.status || "unknown";
-
-        // Prefer unix seconds, then ISO timestamps, else now()
-        let ts = null;
-        if (typeof ev?.timestamp === "number") ts = new Date(ev.timestamp * 1000);
-        else if (typeof ev?.time === "number") ts = new Date(ev.time * 1000);
-        else if (typeof ev?.created_at === "string") ts = new Date(ev.created_at);
-        else if (typeof ev?.timestamp === "string") ts = new Date(ev.timestamp);
-        else ts = new Date();
-
-        const ip = ev?.ip || detail?.ip || null;
-        const reason = ev?.reason || detail?.reason || null;
-        const response = ev?.response || detail?.response || null;
-        const status = ev?.status || detail?.status || null;
-
-        await client.query(
-          `
-          insert into sendgrid_events (
-            sg_account, sg_message_id, event_ts, event, ip, email, recipient_domain,
-            reason, response, status, raw
-          )
-          values (
-            $1, $2, $3, $4, $5, $6, $7,
-            $8, $9, $10, $11::jsonb
-          )
-          on conflict (event_key) do update
-set
-  event_ts = excluded.event_ts,
-  reason   = excluded.reason,
-  response = excluded.response,
-  status   = excluded.status,
-  raw      = excluded.raw;
-          `,
-          [
-            account.id,
-            sgMessageId,
-            ts,
-            String(eventName).toLowerCase(),
-            ip,
-            email,
-            recipientDomain,
-            reason,
-            response,
-            status,
-            JSON.stringify({ detail, ev }),
-          ]
-        );
-
-        inserted += 1;
       }
     }
 
