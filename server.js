@@ -131,7 +131,25 @@ async function initDb() {
     add column if not exists sg_account text;
   `);
 
-  console.log("DB initialized");
+  
+  // Ensure event_key column exists for safe upserts during rolling refresh
+  await pool.query(`
+    alter table sendgrid_events
+    add column if not exists event_key text;
+  `);
+
+  await pool.query(`
+    create unique index if not exists ux_sendgrid_events_event_key
+    on sendgrid_events (event_key);
+  `);
+
+  // Helpful for retention deletes
+  await pool.query(`
+    create index if not exists idx_sendgrid_events_event_ts
+    on sendgrid_events (event_ts);
+  `);
+
+console.log("DB initialized");
 }
 
 // ---- Email Logs Polling Helpers ----
@@ -252,17 +270,55 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
 
       if (normalizedEvents.length === 0) {
         // Insert a single row as “log” if no event details found
+        // Insert a single row as “log” if no event details found
+        const tsLog = new Date();
+        const eventKey = makeEventKey({
+          sgAccount: account.id,
+          sgMessageId,
+          event: "log",
+          eventTs: tsLog,
+          email,
+          ip: null,
+          status: detail?.status || null,
+          response: detail?.response || null,
+        });
+
         await client.query(
           `
           insert into sendgrid_events (
-            sg_account, sg_message_id, event_ts, event, email, recipient_domain, raw
+            event_key,
+            sg_account, sg_message_id, event_ts, event, ip, email, recipient_domain,
+            reason, response, status, raw
           )
-          values ($1, $2, now(), $3, $4, $5, $6::jsonb)
-          on conflict do nothing
+          values (
+            $1,
+            $2, $3, $4, $5, $6, $7, $8,
+            $9, $10, $11, $12::jsonb
+          )
+          on conflict (event_key) do update
+          set
+            event_ts = excluded.event_ts,
+            reason   = excluded.reason,
+            response = excluded.response,
+            status   = excluded.status,
+            raw      = excluded.raw
           `,
-          [account.id, sgMessageId, "log", email, recipientDomain, JSON.stringify(detail)]
+          [
+            eventKey,
+            account.id,
+            sgMessageId,
+            ts,
+            String(eventName).toLowerCase(),
+            ip,
+            email,
+            recipientDomain,
+            reason,
+            response,
+            status,
+            JSON.stringify({ detail, ev }),
+          ]
         );
-        inserted += 1;
+inserted += 1;
         continue;
       }
 
@@ -380,7 +436,7 @@ async function cleanupOldEvents(days = 90) {
   await pool.query(
     `
     delete from sendgrid_events
-    where event_ts < now() - ($1 || ' days')::interval
+    where event_ts < now() - make_interval(days => $1)
     `,
     [days]
   );
