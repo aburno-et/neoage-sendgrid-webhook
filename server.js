@@ -18,6 +18,35 @@ function requireAdmin(req, res) {
   return true;
 }
 
+
+const crypto = require("crypto");
+
+function makeEventKey({
+  sgAccount,
+  sgMessageId,
+  event,
+  eventTs,
+  email,
+  ip,
+  status,
+  response,
+}) {
+  const raw = [
+    sgAccount,
+    sgMessageId,
+    event,
+    eventTs ? new Date(eventTs).toISOString() : "",
+    email || "",
+    ip || "",
+    status || "",
+    response || "",
+  ].join("|");
+
+  return crypto.createHash("sha1").update(raw).digest("hex");
+}
+
+
+
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
