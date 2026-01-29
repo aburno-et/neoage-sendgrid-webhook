@@ -1,5 +1,10 @@
 const express = require("express");
 const { Pool } = require("pg");
+const SENDGRID_ACCOUNTS = [
+  { id: "account_a", apiKey: process.env.SENDGRID_API_KEY_ACCOUNT_A },
+  { id: "account_b", apiKey: process.env.SENDGRID_API_KEY_ACCOUNT_B },
+  { id: "account_c", apiKey: process.env.SENDGRID_API_KEY_ACCOUNT_C },
+].filter((a) => a.apiKey);
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
