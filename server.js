@@ -582,7 +582,8 @@ app.post("/webhooks/sendgrid/events", async (req, res) => {
       );
     }
 
-    await client.query("commit");
+    
+await client.query("commit");
   } catch (err) {
     await client.query("rollback");
     console.error("Insert failed:", err);
