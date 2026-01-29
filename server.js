@@ -294,7 +294,13 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
             $1, $2, $3, $4, $5, $6, $7,
             $8, $9, $10, $11::jsonb
           )
-          on conflict do nothing
+          on conflict (event_key) do update
+set
+  event_ts = excluded.event_ts,
+  reason   = excluded.reason,
+  response = excluded.response,
+  status   = excluded.status,
+  raw      = excluded.raw;
           `,
           [
             account.id,
@@ -344,6 +350,42 @@ async function pollAllAccountsOnce() {
   return results;
 }
 
+async function refreshAccount(account, days = 30) {
+  const now = new Date();
+  const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+
+  const windowMs = 6 * 60 * 60 * 1000; // 6 hours
+  let cursor = start;
+
+  while (cursor < now) {
+    await setLastSeen(account.id, cursor);
+    await pollEmailLogsForAccount(account);
+
+    cursor = new Date(
+      Math.min(cursor.getTime() + windowMs, now.getTime())
+    );
+
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+async function refreshAllAccounts(days = 30) {
+  for (const acct of SENDGRID_ACCOUNTS) {
+    await refreshAccount(acct, days);
+  }
+}
+
+
+async function cleanupOldEvents(days = 90) {
+  await pool.query(
+    `
+    delete from sendgrid_events
+    where event_ts < now() - ($1 || ' days')::interval
+    `,
+    [days]
+  );
+}
+
 // Initialize DB on startup
 initDb().catch((err) => {
   console.error("DB init failed:", err);
@@ -372,6 +414,26 @@ app.post("/admin/poll-email-logs", async (req, res) => {
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
+
+
+
+app.post("/admin/maintenance", async (req, res) => {
+  if (req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  try {
+    await refreshAllAccounts(30);
+    await cleanupOldEvents(90);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Maintenance failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 
 app.get("/admin/accounts", (req, res) => {
   res.json({
