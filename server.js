@@ -319,16 +319,7 @@ async function pollEmailLogsForAccount(account) {
         const response = ev?.response || detail?.response || null;
         const status = ev?.status || detail?.status || null;
 
-        const eventKey = makeEventKey({
-          sgAccount: account.id,
-          sgMessageId,
-          event: String(eventName).toLowerCase(),
-          eventTs: ts,
-          email,
-          ip,
-          status,
-          response,
-        });
+ 
 
         await client.query(
           `
