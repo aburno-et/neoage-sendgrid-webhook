@@ -1,8 +1,10 @@
 const express = require("express");
 const { Pool } = require("pg");
-
+const crypto = require("crypto");
 
 // ---- SendGrid accounts (Email Logs polling) ----
+// Set these in Render Environment Variables.
+// Example IDs: account_a/account_b/account_c
 const SENDGRID_ACCOUNTS = [
   { id: "account_a", apiKey: process.env.SENDGRID_API_KEY_ACCOUNT_A },
   { id: "account_b", apiKey: process.env.SENDGRID_API_KEY_ACCOUNT_B },
@@ -18,9 +20,6 @@ function requireAdmin(req, res) {
   return true;
 }
 
-
-const crypto = require("crypto");
-
 function makeEventKey({
   sgAccount,
   sgMessageId,
@@ -32,9 +31,9 @@ function makeEventKey({
   response,
 }) {
   const raw = [
-    sgAccount,
-    sgMessageId,
-    event,
+    sgAccount || "",
+    sgMessageId || "",
+    event || "",
     eventTs ? new Date(eventTs).toISOString() : "",
     email || "",
     ip || "",
@@ -45,8 +44,6 @@ function makeEventKey({
   return crypto.createHash("sha1").update(raw).digest("hex");
 }
 
-
-
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
@@ -55,8 +52,6 @@ if (!process.env.DATABASE_URL) {
   console.error("Missing DATABASE_URL env var");
 }
 
-// Render Postgres typically requires SSL. This setting is safe for managed DBs.
-// If your Internal URL doesn't require SSL, Postgres will still connect fine.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -86,32 +81,51 @@ async function initDb() {
       response text,
       status text,
 
-      -- custom_args for filtering
+      -- custom_args for filtering (webhook payloads)
       sending_domain text,
       stream text,
       campaign text,
       ip_pool text,
       environment text,
 
+      -- polling support
+      sg_account text,
+      event_key text,
+
       raw jsonb not null
     );
   `);
 
+  // Ensure columns exist even if table predates them
+  await pool.query(`alter table sendgrid_events add column if not exists sg_account text;`);
+  await pool.query(`alter table sendgrid_events add column if not exists event_key text;`);
+
+  // Webhook dedupe
   await pool.query(`
     create unique index if not exists ux_sendgrid_events_sg_event_id
     on sendgrid_events (sg_event_id)
     where sg_event_id is not null;
   `);
 
+  // Polling dedupe/upsert key
   await pool.query(`
-    create index if not exists idx_sge_event_ts on sendgrid_events (event_ts desc);
+    create unique index if not exists ux_sendgrid_events_event_key
+    on sendgrid_events (event_key)
+    where event_key is not null;
+  `);
+
+  // Helpful indexes
+  await pool.query(`
+    create index if not exists idx_sendgrid_events_event_ts
+    on sendgrid_events (event_ts desc);
   `);
 
   await pool.query(`
-    create index if not exists idx_sge_domain_ip_ts on sendgrid_events (sending_domain, ip, event_ts desc);
+    create index if not exists idx_sge_domain_ip_ts
+    on sendgrid_events (sending_domain, ip, event_ts desc);
   `);
 
-  // Track polling cursor per SendGrid account
+  // Poll cursor state
   await pool.query(`
     create table if not exists sg_poll_state (
       sg_account text primary key,
@@ -119,37 +133,7 @@ async function initDb() {
     );
   `);
 
-  // Helpful dedupe for polling (webhook has sg_event_id; logs polling might not)
-  await pool.query(`
-    create unique index if not exists ux_sendgrid_events_poll_dedupe
-    on sendgrid_events (sg_account, sg_message_id, event_ts, event, coalesce(email,''));
-  `);
-
-  // Ensure sg_account column exists (you already added it, this is just safe)
-  await pool.query(`
-    alter table sendgrid_events
-    add column if not exists sg_account text;
-  `);
-
-  
-  // Ensure event_key column exists for safe upserts (Email Logs refresh)
-  await pool.query(`
-    alter table sendgrid_events
-    add column if not exists event_key text;
-  `);
-
-  await pool.query(`
-    create unique index if not exists ux_sendgrid_events_event_key
-    on sendgrid_events (event_key);
-  `);
-
-  // Helpful for retention deletes
-  await pool.query(`
-    create index if not exists idx_sendgrid_events_event_ts
-    on sendgrid_events (event_ts);
-  `);
-
-console.log("DB initialized");
+  console.log("DB initialized");
 }
 
 // ---- Email Logs Polling Helpers ----
@@ -180,18 +164,14 @@ async function setLastSeen(sgAccount, dt) {
 }
 
 function toSendGridTimestamp(dt) {
-  // SendGrid logs query expects TIMESTAMP "YYYY-MM-DDTHH:MM:SSZ"
   return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 async function sgFetch(account, method, path, body) {
   const url = `https://api.sendgrid.com${path}`;
 
-  // Basic retry for transient SendGrid/API errors (429/5xx).
-  // This prevents one temporary 500 from failing the entire poll run.
+  // Retry transient SendGrid errors (429/5xx)
   const maxAttempts = 5;
-  let lastErrText = "";
-
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const res = await fetch(url, {
       method,
@@ -205,9 +185,6 @@ async function sgFetch(account, method, path, body) {
     if (res.ok) return res.json();
 
     const text = await res.text();
-    lastErrText = text;
-
-    // Retry on rate limits + server errors
     const retryable =
       res.status === 429 || (res.status >= 500 && res.status <= 599);
 
@@ -217,7 +194,6 @@ async function sgFetch(account, method, path, body) {
       );
     }
 
-    // Exponential backoff with jitter
     const baseMs = 500 * Math.pow(2, attempt - 1);
     const jitterMs = Math.floor(Math.random() * 250);
     const waitMs = baseMs + jitterMs;
@@ -225,29 +201,22 @@ async function sgFetch(account, method, path, body) {
     console.warn(
       `SendGrid transient error (${account.id}) ${res.status} attempt ${attempt}/${maxAttempts} — retrying in ${waitMs}ms`
     );
-
     await new Promise((r) => setTimeout(r, waitMs));
   }
-
-  // Should never hit, but keeps TypeScript linters happy (if ever migrated)
-  throw new Error(
-    `SendGrid API error (${account.id}) unknown: ${String(lastErrText).slice(0, 500)}`
-  );
 }
 
-
-async function pollEmailLogsForAccount(account, windowMinutes = 10) {
+async function pollEmailLogsForAccount(account) {
   const since = await getLastSeen(account.id);
   const until = new Date();
 
-  // small overlap to avoid missing edge events; dedupe index prevents duplicates
+  // overlap to avoid missing edge events (upsert handles duplicates safely)
   const overlapMs = 2 * 60 * 1000;
   const sinceOverlap = new Date(new Date(since).getTime() - overlapMs);
 
   const sinceStr = toSendGridTimestamp(sinceOverlap);
   const untilStr = toSendGridTimestamp(until);
 
-  // 1) Search logs for messages created in the window
+  // Search logs for messages created in the window
   const searchBody = {
     query:
       `sg_message_id_created_at > TIMESTAMP "${sinceStr}" ` +
@@ -256,8 +225,6 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
   };
 
   const search = await sgFetch(account, "POST", "/v3/logs", searchBody);
-
-  // The response shape can vary slightly; try common fields
   const messages = search?.result || search?.results || search?.messages || [];
   const sgMessageIds = [];
 
@@ -269,7 +236,6 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
   let inserted = 0;
   let hydrated = 0;
 
-  // 2) Hydrate each message for its event trail/details
   const client = await pool.connect();
   try {
     await client.query("begin");
@@ -283,11 +249,9 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
         `/v3/logs/${encodeURIComponent(sgMessageId)}`
       );
 
-      // We’ll try to locate an events array. If none, we store at least a “log” row.
       const events =
         detail?.events || detail?.event || detail?.items || detail?.results || [];
 
-      // Try to locate a recipient email if provided (shape varies)
       const email =
         detail?.to_email || detail?.email || detail?.recipient || detail?.to || null;
 
@@ -296,11 +260,9 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
           ? email.split("@").pop().toLowerCase()
           : null;
 
-      // If events is not an array, normalize
       const normalizedEvents = Array.isArray(events) ? events : [events];
 
       if (normalizedEvents.length === 0) {
-        // Insert a single row as “log” if no event details found
         const tsLog = new Date();
         const eventKey = makeEventKey({
           sgAccount: account.id,
@@ -313,53 +275,98 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
           response: detail?.response || null,
         });
 
-        const eventKey = makeEventKey({
-        sgAccount: account.id,
-        sgMessageId,
-        event: String(eventName).toLowerCase(),
-        eventTs: ts,
-        email,
-        ip,
-        status,
-        response,
-      });
+        await client.query(
+          `
+          insert into sendgrid_events (
+            event_key,
+            sg_account, sg_message_id, event_ts, event, email, recipient_domain, raw
+          )
+          values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+          on conflict (event_key) do update
+          set
+            event_ts = excluded.event_ts,
+            raw      = excluded.raw
+          `,
+          [
+            eventKey,
+            account.id,
+            sgMessageId,
+            tsLog,
+            "log",
+            email,
+            recipientDomain,
+            JSON.stringify(detail),
+          ]
+        );
 
-      await client.query(
-        `
-        insert into sendgrid_events (
-          event_key,
-          sg_account, sg_message_id, event_ts, event, ip, email, recipient_domain,
-          reason, response, status, raw
-        )
-        values (
-          $1,
-          $2, $3, $4, $5, $6, $7, $8,
-          $9, $10, $11, $12::jsonb
-        )
-        on conflict (event_key) do update
-        set
-          event_ts = excluded.event_ts,
-          reason   = excluded.reason,
-          response = excluded.response,
-          status   = excluded.status,
-          raw      = excluded.raw
-        `,
-        [
-          eventKey,
-          account.id,
+        inserted += 1;
+        continue;
+      }
+
+      for (const ev of normalizedEvents) {
+        const eventName =
+          ev?.event || ev?.type || ev?.name || detail?.status || "unknown";
+
+        let ts = null;
+        if (typeof ev?.timestamp === "number") ts = new Date(ev.timestamp * 1000);
+        else if (typeof ev?.time === "number") ts = new Date(ev.time * 1000);
+        else if (typeof ev?.created_at === "string") ts = new Date(ev.created_at);
+        else if (typeof ev?.timestamp === "string") ts = new Date(ev.timestamp);
+        else ts = new Date();
+
+        const ip = ev?.ip || detail?.ip || null;
+        const reason = ev?.reason || detail?.reason || null;
+        const response = ev?.response || detail?.response || null;
+        const status = ev?.status || detail?.status || null;
+
+        const eventKey = makeEventKey({
+          sgAccount: account.id,
           sgMessageId,
-          ts,
-          String(eventName).toLowerCase(),
-          ip,
+          event: String(eventName).toLowerCase(),
+          eventTs: ts,
           email,
-          recipientDomain,
-          reason,
-          response,
+          ip,
           status,
-          JSON.stringify({ detail, ev }),
-        ]
-      );
-inserted += 1;
+          response,
+        });
+
+        await client.query(
+          `
+          insert into sendgrid_events (
+            event_key,
+            sg_account, sg_message_id, event_ts, event, ip, email, recipient_domain,
+            reason, response, status, raw
+          )
+          values (
+            $1,
+            $2, $3, $4, $5, $6, $7, $8,
+            $9, $10, $11, $12::jsonb
+          )
+          on conflict (event_key) do update
+          set
+            event_ts = excluded.event_ts,
+            reason   = excluded.reason,
+            response = excluded.response,
+            status   = excluded.status,
+            raw      = excluded.raw
+          `,
+          [
+            eventKey,
+            account.id,
+            sgMessageId,
+            ts,
+            String(eventName).toLowerCase(),
+            ip,
+            email,
+            recipientDomain,
+            reason,
+            response,
+            status,
+            JSON.stringify({ detail, ev }),
+          ]
+        );
+
+        inserted += 1;
       }
     }
 
@@ -371,7 +378,6 @@ inserted += 1;
     client.release();
   }
 
-  // Advance cursor to "until"
   await setLastSeen(account.id, until);
 
   return {
@@ -412,10 +418,7 @@ async function refreshAccount(account, days = 30) {
     await setLastSeen(account.id, cursor);
     await pollEmailLogsForAccount(account);
 
-    cursor = new Date(
-      Math.min(cursor.getTime() + windowMs, now.getTime())
-    );
-
+    cursor = new Date(Math.min(cursor.getTime() + windowMs, now.getTime()));
     await new Promise((r) => setTimeout(r, 500));
   }
 }
@@ -425,7 +428,6 @@ async function refreshAllAccounts(days = 30) {
     await refreshAccount(acct, days);
   }
 }
-
 
 async function cleanupOldEvents(days = 90) {
   await pool.query(
@@ -444,7 +446,6 @@ initDb().catch((err) => {
 
 // ---- Routes ----
 app.get("/health", async (req, res) => {
-  // basic DB connectivity check
   try {
     await pool.query("select 1 as ok");
     res.status(200).send("ok");
@@ -454,38 +455,9 @@ app.get("/health", async (req, res) => {
   }
 });
 
-app.post("/admin/poll-email-logs", async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-
-  try {
-    const results = await pollAllAccountsOnce();
-    res.json({ ok: true, results });
-  } catch (err) {
-    console.error("Polling failed:", err);
-    res.status(500).json({ ok: false, error: String(err.message || err) });
-  }
+app.get("/admin/accounts", (req, res) => {
+  res.json({ accountsConfigured: SENDGRID_ACCOUNTS.map((a) => a.id) });
 });
-
-
-
-app.post("/admin/maintenance", async (req, res) => {
-  if (req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) {
-    return res.status(401).json({ error: "unauthorized" });
-  }
-
-  try {
-    await refreshAllAccounts(30);
-    await cleanupOldEvents(90);
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("Maintenance failed:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
-
 
 app.post("/admin/test-sendgrid-logs", async (req, res) => {
   if (!requireAdmin(req, res)) return;
@@ -515,23 +487,37 @@ app.post("/admin/test-sendgrid-logs", async (req, res) => {
   }
 });
 
-app.get("/admin/accounts", (req, res) => {
-  res.json({
-    accountsConfigured: SENDGRID_ACCOUNTS.map((a) => a.id),
-  });
+app.post("/admin/poll-email-logs", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    const results = await pollAllAccountsOnce();
+    res.json({ ok: true, results });
+  } catch (err) {
+    console.error("Polling failed:", err);
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
 });
 
+app.post("/admin/maintenance", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+
+  try {
+    await refreshAllAccounts(30);
+    await cleanupOldEvents(90);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Maintenance failed:", err);
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// Webhook endpoint (optional)
 app.post("/webhooks/sendgrid/events", async (req, res) => {
   const events = req.body;
 
-  if (!Array.isArray(events)) {
-    console.log("Received non-array payload");
-    return res.status(204).send();
-  }
+  if (!Array.isArray(events)) return res.status(204).send();
 
-  console.log(`Received ${events.length} SendGrid events`);
-
-  // Bulk insert (simple + reliable for your scale)
   const client = await pool.connect();
   try {
     await client.query("begin");
@@ -564,7 +550,7 @@ app.post("/webhooks/sendgrid/events", async (req, res) => {
         [
           e.sg_event_id || null,
           e.sg_message_id || null,
-          e.timestamp || null, // SendGrid gives unix seconds
+          e.timestamp || null,
           e.event || "unknown",
           e.ip || null,
           email,
@@ -582,11 +568,10 @@ app.post("/webhooks/sendgrid/events", async (req, res) => {
       );
     }
 
-    
-await client.query("commit");
+    await client.query("commit");
   } catch (err) {
     await client.query("rollback");
-    console.error("Insert failed:", err);
+    console.error("Webhook insert failed:", err);
   } finally {
     client.release();
   }
@@ -594,7 +579,6 @@ await client.query("commit");
   res.status(204).send();
 });
 
-// ---- Listen ----
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Listening on port ${PORT}`);
