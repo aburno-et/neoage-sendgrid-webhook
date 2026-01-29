@@ -1,10 +1,20 @@
 const express = require("express");
 const { Pool } = require("pg");
+// ---- SendGrid accounts (Email Logs polling) ----
 const SENDGRID_ACCOUNTS = [
   { id: "account_a", apiKey: process.env.SENDGRID_API_KEY_ACCOUNT_A },
   { id: "account_b", apiKey: process.env.SENDGRID_API_KEY_ACCOUNT_B },
   { id: "account_c", apiKey: process.env.SENDGRID_API_KEY_ACCOUNT_C },
 ].filter((a) => a.apiKey);
+
+function requireAdmin(req, res) {
+  const token = req.header("x-admin-token");
+  if (!process.env.ADMIN_TOKEN || token !== process.env.ADMIN_TOKEN) {
+    res.status(401).json({ error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
