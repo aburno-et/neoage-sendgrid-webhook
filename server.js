@@ -217,11 +217,15 @@ const minAllowed = new Date(Date.now() - THIRTY_DAYS_MS);
 const effectiveSince = since < minAllowed ? minAllowed : since;
 
 
-  // overlap to avoid missing edge events (upsert handles duplicates safely)
-  const overlapMs = 2 * 60 * 1000;
-  const sinceOverlap = new Date(new Date(effectiveSince).getTime() - overlapMs);
+// overlap to avoid missing edge events (upsert handles duplicates safely)
+const overlapMs = 2 * 60 * 1000;
 
-  const sinceStr = toSendGridTimestamp(sinceOverlap);
+// Never allow the lower bound to go older than 30 days (SendGrid hard limit)
+const sinceOverlapCandidate = new Date(new Date(effectiveSince).getTime() - overlapMs);
+const sinceOverlap = sinceOverlapCandidate < minAllowed ? minAllowed : sinceOverlapCandidate;
+
+const sinceStr = toSendGridTimestamp(sinceOverlap);
+
   const untilStr = toSendGridTimestamp(until);
 
   // Search logs for messages created in the window
