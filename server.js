@@ -263,45 +263,45 @@ async function pollEmailLogsForAccount(account) {
       const normalizedEvents = Array.isArray(events) ? events : [events];
 
       if (normalizedEvents.length === 0) {
-        const tsLog = new Date();
-        const eventKey = makeEventKey({
-          sgAccount: account.id,
-          sgMessageId,
-          event: "log",
-          eventTs: tsLog,
-          email,
-          ip: null,
-          status: detail?.status || null,
-          response: detail?.response || null,
-        });
+  const tsLog = new Date();
+  const eventKeyLog = makeEventKey({
+    sgAccount: account.id,
+    sgMessageId,
+    event: "log",
+    eventTs: tsLog,
+    email,
+    ip: null,
+    status: detail?.status || null,
+    response: detail?.response || null,
+  });
 
-        await client.query(
-          `
-          insert into sendgrid_events (
-            event_key,
-            sg_account, sg_message_id, event_ts, event, email, recipient_domain, raw
-          )
-          values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-          on conflict (event_key) do update
-          set
-            event_ts = excluded.event_ts,
-            raw      = excluded.raw
-          `,
-          [
-            eventKey,
-            account.id,
-            sgMessageId,
-            tsLog,
-            "log",
-            email,
-            recipientDomain,
-            JSON.stringify(detail),
-          ]
-        );
+  await client.query(
+    `
+    insert into sendgrid_events (
+      event_key,
+      sg_account, sg_message_id, event_ts, event, email, recipient_domain, raw
+    )
+    values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+    on conflict (event_key) do update
+    set
+      event_ts = excluded.event_ts,
+      raw      = excluded.raw
+    `,
+    [
+      eventKeyLog,
+      account.id,
+      sgMessageId,
+      tsLog,
+      "log",
+      email,
+      recipientDomain,
+      JSON.stringify(detail),
+    ]
+  );
 
-        inserted += 1;
-        continue;
-      }
+  inserted += 1;
+  continue;
+}
 
       for (const ev of normalizedEvents) {
         const eventName =
@@ -319,7 +319,16 @@ async function pollEmailLogsForAccount(account) {
         const response = ev?.response || detail?.response || null;
         const status = ev?.status || detail?.status || null;
 
- 
+        const eventKey = makeEventKey({
+          sgAccount: account.id,
+          sgMessageId,
+          event: String(eventName).toLowerCase(),
+          eventTs: ts,
+          email,
+          ip,
+          status,
+          response,
+        });
 
         await client.query(
           `
