@@ -191,9 +191,14 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
   const since = await getLastSeen(account.id);
   const until = new Date();
 
-  // --- SendGrid API hard limit: 30-day lookback ---
-  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
-  const minAllowed = new Date(Date.now() - THIRTY_DAYS_MS);
+// --- SendGrid API hard limit: 30-day lookback ---
+// Add a safety buffer so we never hit "exactly 30 days" edge cases
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+const SAFETY_MS = 5 * 60 * 1000; // 5 minutes
+
+// Minimum allowed lower bound for SendGrid queries (within last 30 days)
+const minAllowed = new Date(Date.now() - (THIRTY_DAYS_MS - SAFETY_MS));
+
 
   // Clamp lookback to last 30 days (SendGrid requirement)
   const effectiveSince = since < minAllowed ? minAllowed : since;
@@ -202,10 +207,19 @@ async function pollEmailLogsForAccount(account, windowMinutes = 10) {
   const overlapMs = 2 * 60 * 1000;
 
   // Apply overlap, but NEVER allow the lower bound to go older than 30 days
-  const sinceOverlapCandidate = new Date(new Date(effectiveSince).getTime() - overlapMs);
-  const sinceOverlap = sinceOverlapCandidate < minAllowed ? minAllowed : sinceOverlapCandidate;
-  const sinceStr = toSendGridTimestamp(sinceOverlap);
+ const overlapMs = 2 * 60 * 1000;
+
+const sinceOverlapCandidate = new Date(new Date(effectiveSince).getTime() - overlapMs);
+const sinceOverlap = sinceOverlapCandidate < minAllowed ? minAllowed : sinceOverlapCandidate;
+
+const sinceStr = toSendGridTimestamp(sinceOverlap);
+
   const untilStr = toSendGridTimestamp(until);
+
+console.log(
+  `[SendGrid Poll] ${account.id} since=${sinceStr} until=${untilStr}`
+);
+
 
   // 1) Search logs for messages created in the window
   const searchBody = {
