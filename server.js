@@ -138,6 +138,300 @@ async function initDb() {
 
 // ---- Email Logs Polling Helpers ----
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isoNoMs(dt) {
+  return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+// SendGrid /v3/logs hard limit is 1000 results per query
+const SG_LOGS_LIMIT = 1000;
+
+// Safety so we never hit "exactly 30 days" edge cases
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+const SAFETY_MS = 5 * 60 * 1000;
+
+// Smallest window we’ll allow when splitting (prevents infinite recursion)
+const MIN_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+function minAllowedLowerBound() {
+  // Must be strictly within last 30 days
+  return new Date(Date.now() - (THIRTY_DAYS_MS - SAFETY_MS));
+}
+
+function clampLowerBound(dt) {
+  const minAllowed = minAllowedLowerBound();
+  return dt < minAllowed ? minAllowed : dt;
+}
+
+/**
+ * 1) Search message IDs in a specific time window.
+ * IMPORTANT: /v3/logs returns at most 1000, so if you get 1000,
+ * you must split the window smaller.
+ */
+async function sgSearchMessageIds(account, sinceDt, untilDt) {
+  const since = clampLowerBound(sinceDt);
+  const until = new Date(untilDt);
+
+  const sinceStr = isoNoMs(since);
+  const untilStr = isoNoMs(until);
+
+  const body = {
+    query:
+      `sg_message_id_created_at > TIMESTAMP "${sinceStr}" ` +
+      `AND sg_message_id_created_at <= TIMESTAMP "${untilStr}"`,
+    limit: SG_LOGS_LIMIT,
+  };
+
+  const search = await sgFetch(account, "POST", "/v3/logs", body);
+
+  const messages = search?.result || search?.results || search?.messages || [];
+  const ids = [];
+
+  for (const m of messages) {
+    const id = m.sg_message_id || m.message_id || m.sg_message_id_string;
+    if (id) ids.push(id);
+  }
+
+  return { ids, count: ids.length, sinceStr, untilStr };
+}
+
+/**
+ * 2) Hydrate message details and upsert events into Postgres.
+ * This reuses your existing insert/upsert semantics; if your table uses
+ * event_key + ON CONFLICT, duplicates are safe.
+ */
+async function hydrateAndStore(account, sgMessageIds) {
+  let inserted = 0;
+  let hydrated = 0;
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    for (const sgMessageId of sgMessageIds) {
+      hydrated++;
+
+      const detail = await sgFetch(
+        account,
+        "GET",
+        `/v3/logs/${encodeURIComponent(sgMessageId)}`
+      );
+
+      const events =
+        detail?.events || detail?.event || detail?.items || detail?.results || [];
+
+      const email =
+        detail?.to_email || detail?.email || detail?.recipient || detail?.to || null;
+
+      const recipientDomain =
+        typeof email === "string" && email.includes("@")
+          ? email.split("@").pop().toLowerCase()
+          : null;
+
+      const normalizedEvents = Array.isArray(events) ? events : [events];
+
+      // If the detail call doesn’t give an events array, store a single “log” row
+      if (!normalizedEvents.length) {
+        await client.query(
+          `
+          insert into sendgrid_events (
+            sg_account, sg_message_id, event_ts, event, email, recipient_domain, raw
+          )
+          values ($1, $2, now(), $3, $4, $5, $6::jsonb)
+          on conflict do nothing
+          `,
+          [
+            account.id,
+            sgMessageId,
+            "log",
+            email,
+            recipientDomain,
+            JSON.stringify(detail),
+          ]
+        );
+        inserted++;
+        continue;
+      }
+
+      for (const ev of normalizedEvents) {
+        const eventName =
+          ev?.event || ev?.type || ev?.name || detail?.status || "unknown";
+
+        let ts = null;
+        if (typeof ev?.timestamp === "number") ts = new Date(ev.timestamp * 1000);
+        else if (typeof ev?.time === "number") ts = new Date(ev.time * 1000);
+        else if (typeof ev?.created_at === "string") ts = new Date(ev.created_at);
+        else if (typeof ev?.timestamp === "string") ts = new Date(ev.timestamp);
+        else ts = new Date();
+
+        const ip = ev?.ip || detail?.ip || null;
+        const reason = ev?.reason || detail?.reason || null;
+        const response = ev?.response || detail?.response || null;
+        const status = ev?.status || detail?.status || null;
+
+        // If your schema includes event_key + ON CONFLICT(event_key) DO UPDATE,
+        // keep using it here. If not, keep your dedupe constraint and DO NOTHING.
+        await client.query(
+          `
+          insert into sendgrid_events (
+            sg_account, sg_message_id, event_ts, event, ip, email, recipient_domain,
+            reason, response, status, raw
+          )
+          values (
+            $1, $2, $3, $4, $5, $6, $7,
+            $8, $9, $10, $11::jsonb
+          )
+          on conflict do nothing
+          `,
+          [
+            account.id,
+            sgMessageId,
+            ts,
+            String(eventName).toLowerCase(),
+            ip,
+            email,
+            recipientDomain,
+            reason,
+            response,
+            status,
+            JSON.stringify({ detail, ev }),
+          ]
+        );
+
+        inserted++;
+      }
+
+      // gentle throttle (avoids SendGrid bursts)
+      await sleep(30);
+    }
+
+    await client.query("commit");
+  } catch (e) {
+    await client.query("rollback");
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  return { hydrated, inserted };
+}
+
+/**
+ * 3) Process one window. If it returns 1000 message IDs, split window smaller.
+ * This is the key that makes “500k messages” possible.
+ */
+async function processWindowRecursive(account, sinceDt, untilDt) {
+  const since = clampLowerBound(sinceDt);
+  const until = new Date(untilDt);
+  const windowMs = until.getTime() - since.getTime();
+
+  // Search IDs in window
+  const search = await sgSearchMessageIds(account, since, until);
+
+  // If we hit the cap, split the window and recurse
+  if (search.count >= SG_LOGS_LIMIT) {
+    if (windowMs <= MIN_WINDOW_MS) {
+      // We’re at minimum window size but still hit 1000.
+      // This means your volume is extremely high in this slice.
+      // We’ll still ingest what we got, but log it so you know it’s incomplete.
+      console.warn(
+        `[Backfill] ${account.id} HIT LIMIT at min window. since=${search.sinceStr} until=${search.untilStr} count=${search.count}`
+      );
+      const store = await hydrateAndStore(account, search.ids);
+      return {
+        ok: true,
+        split: false,
+        capped: true,
+        since: search.sinceStr,
+        until: search.untilStr,
+        foundMessages: search.count,
+        ...store,
+      };
+    }
+
+    const mid = new Date(since.getTime() + Math.floor(windowMs / 2));
+    const left = await processWindowRecursive(account, since, mid);
+    const right = await processWindowRecursive(account, mid, until);
+
+    return {
+      ok: true,
+      split: true,
+      capped: false,
+      since: isoNoMs(since),
+      until: isoNoMs(until),
+      foundMessages: left.foundMessages + right.foundMessages,
+      hydrated: left.hydrated + right.hydrated,
+      inserted: left.inserted + right.inserted,
+      children: [left, right],
+    };
+  }
+
+  // Otherwise safe to hydrate all
+  const store = await hydrateAndStore(account, search.ids);
+
+  return {
+    ok: true,
+    split: false,
+    capped: false,
+    since: search.sinceStr,
+    until: search.untilStr,
+    foundMessages: search.count,
+    ...store,
+  };
+}
+
+/**
+ * 4) Backfill last N days by iterating day windows.
+ * Each day window will split further if it hits the 1000 cap.
+ */
+async function backfillLastNDays(account, days = 30) {
+  const now = new Date();
+  const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+
+  // Clamp start so we never exceed SendGrid’s 30-day rule
+  const effectiveStart = clampLowerBound(start);
+
+  const out = [];
+  let cursor = new Date(effectiveStart);
+
+  while (cursor < now) {
+    const dayEnd = new Date(Math.min(cursor.getTime() + 24 * 60 * 60 * 1000, now.getTime()));
+
+    console.log(
+      `[Backfill] ${account.id} window ${isoNoMs(cursor)} → ${isoNoMs(dayEnd)}`
+    );
+
+    const res = await processWindowRecursive(account, cursor, dayEnd);
+    out.push(res);
+
+    cursor = dayEnd;
+
+    // throttle between days
+    await sleep(300);
+  }
+
+  return out;
+}
+
+async function backfillAllAccounts(days = 30) {
+  const results = [];
+  for (const acct of SENDGRID_ACCOUNTS) {
+    const r = await backfillLastNDays(acct, days);
+    results.push({
+      account: acct.id,
+      ok: true,
+      days,
+      result: r,
+    });
+  }
+  return results;
+}
+
+
+
 async function getLastSeen(sgAccount) {
   const r = await pool.query(
     `select last_seen from sg_poll_state where sg_account = $1`,
@@ -500,6 +794,35 @@ app.post("/admin/test-sendgrid-logs", async (req, res) => {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
+
+
+
+app.post("/admin/backfill", async (req, res) => {
+  try {
+    // use the same admin auth you already use elsewhere
+    const token = req.header("x-admin-token") || "";
+    if (!process.env.ADMIN_TOKEN || token !== process.env.ADMIN_TOKEN) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const days = Number(req.body?.days || 30);
+
+    // SendGrid cannot go older than 30 days via API
+    if (days > 30) {
+      return res.status(400).json({
+        ok: false,
+        error: "SendGrid Email Activity API supports backfill up to 30 days only.",
+      });
+    }
+
+    const results = await backfillAllAccounts(days);
+    res.json({ ok: true, results });
+  } catch (err) {
+    console.error("Backfill failed:", err);
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
 
 app.post("/admin/poll-email-logs", async (req, res) => {
   if (!requireAdmin(req, res)) return;
