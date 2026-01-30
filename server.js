@@ -209,9 +209,17 @@ async function pollEmailLogsForAccount(account) {
   const since = await getLastSeen(account.id);
   const until = new Date();
 
+// --- SendGrid API hard limit: 30-day lookback ---
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+const minAllowed = new Date(Date.now() - THIRTY_DAYS_MS);
+
+// Clamp lookback to last 30 days (SendGrid requirement)
+const effectiveSince = since < minAllowed ? minAllowed : since;
+
+
   // overlap to avoid missing edge events (upsert handles duplicates safely)
   const overlapMs = 2 * 60 * 1000;
-  const sinceOverlap = new Date(new Date(since).getTime() - overlapMs);
+  const sinceOverlap = new Date(new Date(effectiveSince).getTime() - overlapMs);
 
   const sinceStr = toSendGridTimestamp(sinceOverlap);
   const untilStr = toSendGridTimestamp(until);
