@@ -26,8 +26,8 @@ const MIN_WINDOW_MS = 10 * 1000; // 10 seconds
 const SG_LOGS_LIMIT = 1000;
 
 // Concurrency for hydration (message detail fetches)
-const HYDRATE_CONCURRENCY = Number(process.env.HYDRATE_CONCURRENCY || 4);
-const PER_REQUEST_DELAY_MS = Number(process.env.PER_REQUEST_DELAY_MS || 10);
+const HYDRATE_CONCURRENCY = Number(process.env.HYDRATE_CONCURRENCY || 1);
+const PER_REQUEST_DELAY_MS = Number(process.env.PER_REQUEST_DELAY_MS || 50);
 
 // Authoritative rolling window
 const ROLLING_WINDOW_HOURS = 48;
@@ -408,22 +408,50 @@ async function hydrateAndStore(account, sgMessageIds, progressCb) {
   let hydrated = 0;
   let inserted = 0;
 
-  const client = await pool.connect();
+  // Single writer client (serial DB writes = no deadlocks)
+  const writer = await pool.connect();
+
+  // Simple async queue for rows to write
+  const queue = [];
+  let doneProducing = false;
+  let writerError = null;
+
+  async function writerLoop() {
+    try {
+      while (!doneProducing || queue.length > 0) {
+        const item = queue.shift();
+        if (!item) {
+          await sleep(5);
+          continue;
+        }
+        await upsertEventRow(writer, item);
+        inserted += 1;
+      }
+    } catch (e) {
+      writerError = e;
+    }
+  }
+
+  const writerPromise = writerLoop();
+
   try {
-    await client.query("begin");
-
     let idx = 0;
-    const workers = new Array(Math.max(1, HYDRATE_CONCURRENCY)).fill(null).map(async () => {
-      while (idx < sgMessageIds.length) {
-        const myIdx = idx++;
-        const sgMessageId = sgMessageIds[myIdx];
 
+    const workers = new Array(Math.max(1, HYDRATE_CONCURRENCY)).fill(null).map(async () => {
+      while (true) {
+        if (writerError) throw writerError;
+
+        const myIdx = idx++;
+        if (myIdx >= sgMessageIds.length) break;
+
+        const sgMessageId = sgMessageIds[myIdx];
         hydrated += 1;
 
         const rows = await hydrateOneMessage(account, sgMessageId);
+
+        // Enqueue rows for the single writer
         for (const row of rows) {
-          await upsertEventRow(client, row);
-          inserted += 1;
+          queue.push(row);
         }
 
         if (PER_REQUEST_DELAY_MS) await sleep(PER_REQUEST_DELAY_MS);
@@ -435,17 +463,19 @@ async function hydrateAndStore(account, sgMessageIds, progressCb) {
     });
 
     await Promise.all(workers);
+    doneProducing = true;
 
-    await client.query("commit");
-  } catch (e) {
-    await client.query("rollback");
-    throw e;
+    await writerPromise;
+
+    if (writerError) throw writerError;
   } finally {
-    client.release();
+    doneProducing = true;
+    writer.release();
   }
 
   return { hydrated, inserted };
 }
+
 
 // -------------------- Window splitting --------------------
 async function processWindowRecursive(account, sinceDt, untilDt) {
