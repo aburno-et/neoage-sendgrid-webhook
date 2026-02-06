@@ -142,9 +142,10 @@ function minAllowedLowerBound() {
   return new Date(Date.now() - (THIRTY_DAYS_MS - SAFETY_MS));
 }
 function clampLowerBound(dt) {
-  const minAllowed = minAllowedLowerBound();
-  return dt < minAllowed ? minAllowed : dt;
+  const rollingFloor = new Date(Date.now() - ROLLING_WINDOW_MS);
+  return dt < rollingFloor ? rollingFloor : dt;
 }
+
 
 function makeEventKey({ sgAccount, sgMessageId, event, eventTs, email }) {
   const base = [
@@ -586,6 +587,7 @@ const until = new Date();
 
       const r = await processWindowRecursive(acct, since, until);
       await setLastSeen(acct.id, until);
+await cleanupOldData();
 
       results.push({ account: acct.id, ok: true, since: isoNoMs(since), until: isoNoMs(until), ...r });
     } catch (err) {
@@ -597,9 +599,9 @@ const until = new Date();
 });
 
 // Admin: fire-and-forget backfill (<=30 days)
-app.post("/admin/backfill", async (req, res) => {
-  if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
-
+app.post("/admin/backfill", (_, res) =>
+  res.status(410).json({ error: "Backfill permanently disabled" })
+);
   const days = Math.min(Number(req.body?.days || 30), 30);
 
   // Respond immediately to avoid Cloudflare/Render timeouts
@@ -617,8 +619,9 @@ app.get("/admin/backfill-status", async (req, res) => {
 });
 
 // Admin: maintenance (backfill 30d async + cleanup >90d)
-app.post("/admin/maintenance", async (req, res) => {
-  if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
+app.post("/admin/maintenance", (_, res) =>
+  res.status(410).json({ error: "Maintenance disabled" })
+);
 
   res.status(202).json({ ok: true, started: true, note: "Maintenance started. Check /admin/backfill-status or logs." });
 
