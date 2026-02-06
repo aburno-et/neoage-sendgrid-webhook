@@ -589,27 +589,34 @@ const until = new Date();
 
       const r = await processWindowRecursive(acct, since, until);
       await setLastSeen(acct.id, until);
-await cleanupOldData();
+
 
       results.push({ account: acct.id, ok: true, since: isoNoMs(since), until: isoNoMs(until), ...r });
     } catch (err) {
       results.push({ account: acct.id, ok: false, error: String(err?.message || err) });
     }
   }
-
+await cleanupOldData();
   res.json({ ok: true, results });
 });
 
-
-
-// Admin: backfill status
-app.get("/admin/backfill-status", async (req, res) => {
+// Admin: fire-and-forget backfill (<=30 days) — DISABLED
+app.post("/admin/backfill", (req, res) => {
   if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
-
-  const r = await pool.query(`select * from backfill_runs order by started_at desc limit 10`);
-  res.json({ ok: true, runs: r.rows });
+  return res.status(410).json({ ok: false, error: "Backfill permanently disabled" });
 });
 
+// Admin: backfill status — DISABLED (optional: keep if you want visibility into old runs)
+app.get("/admin/backfill-status", (req, res) => {
+  if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  return res.status(410).json({ ok: false, error: "Backfill permanently disabled" });
+});
+
+// Admin: maintenance — DISABLED
+app.post("/admin/maintenance", (req, res) => {
+  if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  return res.status(410).json({ ok: false, error: "Maintenance disabled" });
+});
 
 
 // Admin: cleanup only
