@@ -138,7 +138,7 @@ if (!SENDGRID_ACCOUNTS.length) {
 
 // -------------------- Helpers --------------------
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-function isoNoMs(dt) { return new Date(dt).toISOString().replace(/\.\\d{3}Z$/, "Z"); }
+function isoNoMs(dt) { return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z"); }
 
 function minAllowedLowerBound() {
   return new Date(Date.now() - (THIRTY_DAYS_MS - SAFETY_MS));
@@ -643,44 +643,60 @@ app.get("/admin/db-info", async (req, res) => {
 app.post("/admin/poll", async (req, res) => {
   if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
 
-  const results = [];
-  for (const acct of SENDGRID_ACCOUNTS) {
-    try {
-     const lastSeen = await getLastSeen(acct.id);
-const rollingFloor = new Date(Date.now() - ROLLING_WINDOW_MS);
-
-// guarantees only one poll runs at a time
-
-const lock = await pool.query("select pg_try_advisory_lock(987654321) as locked");
-if (!lock.rows[0].locked) {
-  return res.status(409).json({ ok: false, error: "poll already running" });
-}
-try {
-  // ... existing poll logic
-} finally {
-  await pool.query("select pg_advisory_unlock(987654321)");
-}
-
-
-// Never re-ingest older than 48h
-const since = lastSeen < rollingFloor ? rollingFloor : lastSeen;
-const until = new Date();
-
-
-      console.log(`[Poll] ${acct.id} since=${isoNoMs(since)} until=${isoNoMs(until)}`);
-
-      const r = await processWindowRecursive(acct, since, until);
-      await setLastSeen(acct.id, until);
-
-
-      results.push({ account: acct.id, ok: true, since: isoNoMs(since), until: isoNoMs(until), ...r });
-    } catch (err) {
-      results.push({ account: acct.id, ok: false, error: String(err?.message || err) });
-    }
+  // One lock for the entire poll run (prevents overlapping cron runs)
+  const lockId = 987654321;
+  const lock = await pool.query("select pg_try_advisory_lock($1) as locked", [lockId]);
+  if (!lock.rows[0].locked) {
+    return res.status(409).json({ ok: false, error: "poll already running" });
   }
-await cleanupOldData();
-  res.json({ ok: true, results });
+
+  const results = [];
+  try {
+    // Use DB time to avoid app clock skew (prevents future last_seen issues)
+    const dbNow = await pool.query("select now() as now");
+    const until = new Date(dbNow.rows[0].now);
+
+    const rollingFloor = new Date(until.getTime() - ROLLING_WINDOW_MS);
+
+    for (const acct of SENDGRID_ACCOUNTS) {
+      try {
+        const lastSeen = await getLastSeen(acct.id);
+
+        // Never re-ingest older than 48h
+        let since = lastSeen < rollingFloor ? rollingFloor : lastSeen;
+
+        // Safety: if cursor is somehow in the future, clamp since to < until
+        if (since >= until) {
+          const safeSince = new Date(until.getTime() - 60 * 1000); // back up 60s
+          console.warn(
+            `[Safety] ${acct.id} since>=until; clamping since from ${isoNoMs(since)} to ${isoNoMs(safeSince)}`
+          );
+          since = safeSince;
+        }
+
+        console.log(`[Poll] ${acct.id} since=${isoNoMs(since)} until=${isoNoMs(until)}`);
+
+        const r = await processWindowRecursive(acct, since, until);
+
+        // Advance cursor to DB-time "until" (not app time)
+        await setLastSeen(acct.id, until);
+
+        results.push({ account: acct.id, ok: true, since: isoNoMs(since), until: isoNoMs(until), ...r });
+      } catch (err) {
+        results.push({ account: acct.id, ok: false, error: String(err?.message || err) });
+      }
+    }
+
+    // Retention: keep only 30 days
+    await cleanupOldData();
+
+    return res.json({ ok: true, results });
+  } finally {
+    // Always release the lock
+    await pool.query("select pg_advisory_unlock($1)", [lockId]);
+  }
 });
+
 
 // Admin: fire-and-forget backfill (<=30 days) — DISABLED
 app.post("/admin/backfill", (req, res) => {
