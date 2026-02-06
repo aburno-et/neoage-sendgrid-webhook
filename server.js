@@ -202,7 +202,7 @@ async function getLastSeen(sgAccount) {
   const r = await pool.query(`select last_seen from sg_poll_state where sg_account = $1`, [sgAccount]);
   if (r.rows.length) return new Date(r.rows[0].last_seen);
 
-  const seed = new Date(Date.now() - 15 * 60 * 1000);
+  const seed = new Date(Date.now() - ROLLING_WINDOW_MS);
   await pool.query(
     `insert into sg_poll_state (sg_account, last_seen) values ($1, $2)
      on conflict (sg_account) do nothing`,
