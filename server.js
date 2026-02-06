@@ -610,23 +610,7 @@ app.get("/admin/backfill-status", async (req, res) => {
   res.json({ ok: true, runs: r.rows });
 });
 
-// Admin: maintenance (backfill 30d async + cleanup >90d)
-app.post("/admin/maintenance", (_, res) =>
-  res.status(410).json({ error: "Maintenance disabled" })
-);
 
-  res.status(202).json({ ok: true, started: true, note: "Maintenance started. Check /admin/backfill-status or logs." });
-
-  (async () => {
-    try {
-      await runBackfillAll(30, "maintenance");
-      const deleted = await cleanupOldData();
-      console.log(`[Maintenance] cleanup deleted=${deleted}`);
-    } catch (e) {
-      console.error("[Maintenance] failed:", e);
-    }
-  })();
-});
 
 // Admin: cleanup only
 app.post("/admin/cleanup", async (req, res) => {
