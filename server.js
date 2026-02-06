@@ -600,17 +600,7 @@ await cleanupOldData();
   res.json({ ok: true, results });
 });
 
-// Admin: fire-and-forget backfill (<=30 days)
-app.post("/admin/backfill", (_, res) =>
-  res.status(410).json({ error: "Backfill permanently disabled" })
-);
-  const days = Math.min(Number(req.body?.days || 30), 30);
 
-  // Respond immediately to avoid Cloudflare/Render timeouts
-  res.status(202).json({ ok: true, started: true, days, note: "Backfill started. Check /admin/backfill-status or Render logs." });
-
-  runBackfillAll(days, "manual").catch((e) => console.error("Backfill runner crashed:", e));
-});
 
 // Admin: backfill status
 app.get("/admin/backfill-status", async (req, res) => {
