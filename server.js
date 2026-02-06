@@ -2,6 +2,10 @@ const express = require("express");
 const { Pool } = require("pg");
 const crypto = require("crypto");
 
+const r = await pool.query("show search_path");
+console.log("DB search_path:", r.rows[0]);
+
+
 // Node 18+ has global fetch (Render uses Node 25 in your logs)
 
 const app = express();
