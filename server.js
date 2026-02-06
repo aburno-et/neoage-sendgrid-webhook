@@ -570,6 +570,45 @@ app.get("/health", async (req, res) => {
   }
 });
 
+
+
+
+
+app.get("/admin/db-info", async (req, res) => {
+  if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
+
+  const info = {};
+  info.database = (await pool.query("select current_database() as db")).rows[0].db;
+  info.schema = (await pool.query("select current_schema() as schema")).rows[0].schema;
+  info.search_path = (await pool.query("show search_path")).rows[0].search_path;
+
+  // Which sendgrid_events does Postgres resolve?
+  const reg = await pool.query("select to_regclass('sendgrid_events') as resolved");
+  info.resolved_table = reg.rows[0].resolved;
+
+  // Where are all sendgrid_events tables?
+  const t = await pool.query(`
+    select table_schema, table_name
+    from information_schema.tables
+    where table_name='sendgrid_events'
+    order by table_schema
+  `);
+  info.all_tables = t.rows;
+
+  // Does the resolved table have sg_account?
+  const c = await pool.query(`
+    select column_name
+    from information_schema.columns
+    where table_name='sendgrid_events' and column_name='sg_account'
+    order by table_schema, ordinal_position
+  `);
+  info.sg_account_columns = c.rows;
+
+  res.json({ ok: true, info });
+});
+
+
+
 // Admin: incremental poll (cursor -> now)
 app.post("/admin/poll", async (req, res) => {
   if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
