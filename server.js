@@ -619,6 +619,19 @@ app.post("/admin/poll", async (req, res) => {
      const lastSeen = await getLastSeen(acct.id);
 const rollingFloor = new Date(Date.now() - ROLLING_WINDOW_MS);
 
+// guarantees only one poll runs at a time
+
+const lock = await pool.query("select pg_try_advisory_lock(987654321) as locked");
+if (!lock.rows[0].locked) {
+  return res.status(409).json({ ok: false, error: "poll already running" });
+}
+try {
+  // ... existing poll logic
+} finally {
+  await pool.query("select pg_advisory_unlock(987654321)");
+}
+
+
 // Never re-ingest older than 48h
 const since = lastSeen < rollingFloor ? rollingFloor : lastSeen;
 const until = new Date();
