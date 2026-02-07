@@ -9,6 +9,12 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
+
+pool.on("error", (err) => {
+  console.error("[PG Pool Error]", err);
+});
+
+
 // -------------------- Config --------------------
 const PORT = process.env.PORT || 10000;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
@@ -27,11 +33,80 @@ const SG_LOGS_LIMIT = 1000;
 
 // Concurrency for hydration (message detail fetches)
 const HYDRATE_CONCURRENCY = Number(process.env.HYDRATE_CONCURRENCY || 1);
-const PER_REQUEST_DELAY_MS = Number(process.env.PER_REQUEST_DELAY_MS || 50);
+const PER_REQUEST_DELAY_MS = Number(process.env.PER_REQUEST_DELAY_MS || 100);
 
 // Authoritative rolling window
 const ROLLING_WINDOW_HOURS = 48;
 const ROLLING_WINDOW_MS = ROLLING_WINDOW_HOURS * 60 * 60 * 1000;
+
+
+// -------------------- Google Postmaster Tools --------------------
+
+const { OAuth2Client } = require("google-auth-library");
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
+
+const GPT_DOMAINS = (process.env.GPT_DOMAINS || "")
+  .split(",")
+  .map(d => d.trim())
+  .filter(Boolean);
+
+
+// Google Postmaster Guard and Token Fetch
+
+function requireGptEnv() {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
+    throw new Error("Missing Google OAuth env vars");
+  }
+  if (!GPT_DOMAINS.length) {
+    throw new Error("GPT_DOMAINS is empty");
+  }
+}
+
+async function getGptAccessToken() {
+  const oauth2 = new OAuth2Client(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET
+  );
+
+  oauth2.setCredentials({
+    refresh_token: GOOGLE_REFRESH_TOKEN
+  });
+
+  const { token } = await oauth2.getAccessToken();
+  if (!token) throw new Error("Failed to obtain GPT access token");
+  return token;
+}
+
+
+
+// Google Postmaster Tools API Fetch DB Upsert
+
+async function fetchGptTrafficStats(domain, startDate, endDate, accessToken) {
+  const url =
+    `https://gmailpostmastertools.googleapis.com/v1/domains/${encodeURIComponent(domain)}/trafficStats` +
+    `?startDate=${startDate}&endDate=${endDate}`;
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+
+  const body = await res.text();
+  if (!res.ok) throw new Error(`GPT API ${res.status}: ${body}`);
+  return JSON.parse(body);
+}
+
+async function upsertGptDay(domain, day, raw) {
+  await pool.query(
+    `insert into gpt_traffic_stats (domain, day, raw)
+     values ($1, $2, $3::jsonb)
+     on conflict (domain, day)
+     do update set raw = excluded.raw, fetched_at = now()`,
+    [domain, day, JSON.stringify(raw)]
+  );
+}
 
 
 
@@ -411,6 +486,11 @@ async function hydrateAndStore(account, sgMessageIds, progressCb) {
   // Single writer client (serial DB writes = no deadlocks)
   const writer = await pool.connect();
 
+client.on("error", (err) => {
+  console.error("[PG Client Error]", err);
+});
+
+
   // Simple async queue for rows to write
   const queue = [];
   let doneProducing = false;
@@ -485,11 +565,23 @@ async function processWindowRecursive(account, sinceDt, untilDt) {
 
   const search = await sgSearchMessageIds(account, since, until);
 
+  // If we hit the ceiling, split. If we can't split further, DO NOT hydrate (reliability first).
   if (search.count >= SG_LOGS_LIMIT) {
     if (windowMs <= MIN_WINDOW_MS) {
-      console.warn(`[Backfill] ${account.id} HIT LIMIT at min window since=${search.sinceStr} until=${search.untilStr} count=${search.count}`);
-      const store = await hydrateAndStore(account, search.ids, null);
-      return { foundMessages: search.count, ...store, capped: true };
+      console.warn(
+        `[Poll] ${account.id} SATURATED at min window since=${search.sinceStr} until=${search.untilStr} count=${search.count} -> skipping hydrate and advancing cursor`
+      );
+
+      // Tell caller to advance cursor so we don't stall forever.
+      const suggestedAdvanceTo = new Date(until.getTime()); // advance to end of this min-window slice
+
+      return {
+        foundMessages: search.count,
+        hydrated: 0,
+        inserted: 0,
+        capped: true,
+        suggestedAdvanceTo,
+      };
     }
 
     const mid = new Date(since.getTime() + Math.floor(windowMs / 2));
@@ -501,11 +593,16 @@ async function processWindowRecursive(account, sinceDt, untilDt) {
       hydrated: (left.hydrated || 0) + (right.hydrated || 0),
       inserted: (left.inserted || 0) + (right.inserted || 0),
       capped: Boolean(left.capped || right.capped),
+      // If either side suggests advancing, use the furthest suggestion
+      suggestedAdvanceTo: [left.suggestedAdvanceTo, right.suggestedAdvanceTo]
+        .filter(Boolean)
+        .sort((a, b) => b.getTime() - a.getTime())[0],
     };
   }
 
+  // Below the ceiling: hydrate normally
   const store = await hydrateAndStore(account, search.ids, null);
-  return { foundMessages: search.count, ...store, capped: false };
+  return { foundMessages: search.count, ...store, capped: false, suggestedAdvanceTo: null };
 }
 
 // -------------------- Backfill runner (fire-and-forget) --------------------
@@ -513,6 +610,7 @@ async function createBackfillRun(days, note) {
   const runId = crypto.randomUUID();
   await pool.query(`insert into backfill_runs (run_id, days, note) values ($1, $2, $3)`, [runId, days, note || null]);
   return runId;
+
 }
 
 async function backfillAccountLastNDays(account, days, runId) {
@@ -676,12 +774,34 @@ app.post("/admin/poll", async (req, res) => {
 
         console.log(`[Poll] ${acct.id} since=${isoNoMs(since)} until=${isoNoMs(until)}`);
 
-        const r = await processWindowRecursive(acct, since, until);
+       // Process in small chunks so we can advance cursor even if a later chunk fails
+const CHUNK_MS = 5 * 60 * 1000; // 5 minutes
+let cursor = new Date(since);
+let agg = { foundMessages: 0, hydrated: 0, inserted: 0, capped: false };
+
+while (cursor < until) {
+  const chunkEnd = new Date(Math.min(cursor.getTime() + CHUNK_MS, until.getTime()));
+
+  const r = await processWindowRecursive(acct, cursor, chunkEnd);
+
+  // Aggregate metrics
+  agg.foundMessages += Number(r.foundMessages || 0);
+  agg.hydrated += Number(r.hydrated || 0);
+  agg.inserted += Number(r.inserted || 0);
+  agg.capped = Boolean(agg.capped || r.capped);
+
+  // Advance cursor: if saturated suggested a safe jump, honor it
+  const nextCursor = r.suggestedAdvanceTo ? new Date(r.suggestedAdvanceTo) : chunkEnd;
+
+  await setLastSeen(acct.id, nextCursor); // commit progress
+  cursor = nextCursor;
+}
+
 
         // Advance cursor to DB-time "until" (not app time)
         await setLastSeen(acct.id, until);
 
-        results.push({ account: acct.id, ok: true, since: isoNoMs(since), until: isoNoMs(until), ...r });
+        results.push({ account: acct.id, ok: true, since: isoNoMs(since), until: isoNoMs(until), ...agg });
       } catch (err) {
         results.push({ account: acct.id, ok: false, error: String(err?.message || err) });
       }
@@ -723,6 +843,68 @@ app.post("/admin/cleanup", async (req, res) => {
   const deleted = await cleanupOldData();
   res.json({ ok: true, deleted });
 });
+
+
+app.post("/admin/gpt/pull", async (req, res) => {
+  if (!authAdmin(req)) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  try {
+    requireGptEnv();
+
+    const days = Math.min(Math.max(Number(req.body?.days || 14), 1), 30);
+
+    // Use DB time (stable)
+    const dbNow = await pool.query("select now() as now");
+    const anchor = new Date(dbNow.rows[0].now);
+
+    // GPT data is daily; pull up to yesterday
+    const end = new Date(anchor);
+    end.setUTCDate(end.getUTCDate() - 1);
+
+    const start = new Date(end);
+    start.setUTCDate(start.getUTCDate() - (days - 1));
+
+    const startDate = start.toISOString().slice(0, 10);
+    const endDate = end.toISOString().slice(0, 10);
+
+    const accessToken = await getGptAccessToken();
+
+    const results = [];
+    for (const domain of GPT_DOMAINS) {
+      try {
+        const data = await fetchGptTrafficStats(domain, startDate, endDate, accessToken);
+        const stats = data.trafficStats || [];
+
+        for (const item of stats) {
+          const d = item.date;
+          let dayStr = null;
+
+          if (typeof d === "string") {
+            dayStr = d.slice(0, 10);
+          } else if (d?.year && d?.month && d?.day) {
+            dayStr = `${d.year}-${String(d.month).padStart(2,"0")}-${String(d.day).padStart(2,"0")}`;
+          }
+
+          if (dayStr) {
+            await upsertGptDay(domain, dayStr, item);
+          }
+        }
+
+        results.push({ domain, ok: true, rows: stats.length });
+      } catch (e) {
+        results.push({ domain, ok: false, error: String(e.message || e) });
+      }
+    }
+
+    res.json({ ok: true, startDate, endDate, results });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+
 
 // -------------------- Start --------------------
 app.listen(PORT, "0.0.0.0", () => {
