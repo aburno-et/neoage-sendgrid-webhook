@@ -1,98 +1,89 @@
+"use strict";
+
 const express = require("express");
 const { Pool } = require("pg");
 const crypto = require("crypto");
-
-
+const { OAuth2Client } = require("google-auth-library");
 
 // Node 18+ has global fetch (Render uses Node 25 in your logs)
 
+// -------------------- App --------------------
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
-
-pool.on("error", (err) => {
-  console.error("[PG Pool Error]", err);
-});
-
+// Hardening: keep the process alive through transient errors
+process.on("unhandledRejection", (err) => console.error("[unhandledRejection]", err));
+process.on("uncaughtException", (err) => console.error("[uncaughtException]", err));
 
 // -------------------- Config --------------------
 const PORT = process.env.PORT || 10000;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const DATABASE_URL = process.env.DATABASE_URL;
 
-if (!DATABASE_URL) {
-  console.error("Missing DATABASE_URL env var");
-}
+if (!DATABASE_URL) console.error("Missing DATABASE_URL env var");
 
-// SendGrid Email Activity API only allows last 30 days.
-// Use a buffer to avoid edge/clock/rounding issues.
+// SendGrid Email Activity API only allows last ~30 days.
+// Buffer avoids edge/clock/rounding issues.
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const SAFETY_MS = 5 * 60 * 1000; // 5 minutes
-const MIN_WINDOW_MS = 10 * 1000; // 10 seconds
+
+// If /v3/logs search returns 1000, split windows.
+// If we still hit 1000 at MIN_WINDOW_MS, we SKIP hydration and advance cursor (reliability-first).
+const MIN_WINDOW_MS = Number(process.env.MIN_WINDOW_MS || 1000); // 1 second
 const SG_LOGS_LIMIT = 1000;
 
 // Concurrency for hydration (message detail fetches)
-const HYDRATE_CONCURRENCY = Number(process.env.HYDRATE_CONCURRENCY || 1);
-const PER_REQUEST_DELAY_MS = Number(process.env.PER_REQUEST_DELAY_MS || 100);
+const HYDRATE_CONCURRENCY = Math.max(1, Number(process.env.HYDRATE_CONCURRENCY || 1));
+const PER_REQUEST_DELAY_MS = Math.max(0, Number(process.env.PER_REQUEST_DELAY_MS || 100));
 
-// Authoritative rolling window
-const ROLLING_WINDOW_HOURS = 48;
+// Rolling window we actively update (data is retained 30 days total)
+const ROLLING_WINDOW_HOURS = Number(process.env.ROLLING_WINDOW_HOURS || 48);
 const ROLLING_WINDOW_MS = ROLLING_WINDOW_HOURS * 60 * 60 * 1000;
 
+// Chunk the poll so we advance cursor progressively (helps avoid timeouts/stalls)
+const CHUNK_MS = Math.max(60_000, Number(process.env.POLL_CHUNK_MS || 5 * 60 * 1000)); // default 5 min
+
+// -------------------- Postgres --------------------
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+pool.on("error", (err) => {
+  console.error("[PG Pool Error]", err);
+});
 
 // -------------------- Google Postmaster Tools --------------------
-
-const { OAuth2Client } = require("google-auth-library");
-
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 
 const GPT_DOMAINS = (process.env.GPT_DOMAINS || "")
   .split(",")
-  .map(d => d.trim())
+  .map((d) => d.trim())
   .filter(Boolean);
-
-
-// Google Postmaster Guard and Token Fetch
 
 function requireGptEnv() {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REFRESH_TOKEN) {
-    throw new Error("Missing Google OAuth env vars");
+    throw new Error("Missing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN");
   }
-  if (!GPT_DOMAINS.length) {
-    throw new Error("GPT_DOMAINS is empty");
-  }
+  if (!GPT_DOMAINS.length) throw new Error("GPT_DOMAINS is empty");
 }
 
 async function getGptAccessToken() {
-  const oauth2 = new OAuth2Client(
-    GOOGLE_CLIENT_ID,
-    GOOGLE_CLIENT_SECRET
-  );
-
-  oauth2.setCredentials({
-    refresh_token: GOOGLE_REFRESH_TOKEN
-  });
-
+  const oauth2 = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+  oauth2.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
   const { token } = await oauth2.getAccessToken();
   if (!token) throw new Error("Failed to obtain GPT access token");
   return token;
 }
 
-
-
-// Google Postmaster Tools API Fetch DB Upsert
-
 async function fetchGptTrafficStats(domain, startDate, endDate, accessToken) {
   const url =
     `https://gmailpostmastertools.googleapis.com/v1/domains/${encodeURIComponent(domain)}/trafficStats` +
-    `?startDate=${startDate}&endDate=${endDate}`;
+    `?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`;
 
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
   const body = await res.text();
   if (!res.ok) throw new Error(`GPT API ${res.status}: ${body}`);
   return JSON.parse(body);
@@ -108,15 +99,7 @@ async function upsertGptDay(domain, day, raw) {
   );
 }
 
-
-
-
-// -------------------- Postgres --------------------
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
-
+// -------------------- DB init --------------------
 async function initDb() {
   await pool.query(`
     create table if not exists sendgrid_events (
@@ -150,7 +133,10 @@ async function initDb() {
   `);
 
   await pool.query(`create index if not exists idx_sge_event_ts on sendgrid_events (event_ts desc);`);
-  await pool.query(`create index if not exists idx_sge_domain_ip_ts on sendgrid_events (sending_domain, ip, event_ts desc);`);
+  await pool.query(
+    `create index if not exists idx_sge_domain_ip_ts on sendgrid_events (sending_domain, ip, event_ts desc);`
+  );
+  await pool.query(`create index if not exists idx_sge_sg_account_ts on sendgrid_events (sg_account, event_ts desc);`);
 
   await pool.query(`
     create table if not exists sg_poll_state (
@@ -159,15 +145,15 @@ async function initDb() {
     );
   `);
 
+  // Kept for historical visibility; endpoints are disabled below.
   await pool.query(`
     create table if not exists backfill_runs (
       run_id uuid primary key,
       started_at timestamptz not null default now(),
       finished_at timestamptz,
-      status text not null default 'running', -- running|success|failed
+      status text not null default 'running',
       days int not null,
       note text,
-
       current_account text,
       current_window_start timestamptz,
       current_window_end timestamptz,
@@ -179,12 +165,22 @@ async function initDb() {
     );
   `);
 
+  await pool.query(`
+    create table if not exists gpt_traffic_stats (
+      id bigserial primary key,
+      domain text not null,
+      day date not null,
+      raw jsonb not null,
+      fetched_at timestamptz not null default now(),
+      unique(domain, day)
+    );
+  `);
+  await pool.query(`create index if not exists idx_gpt_domain_day on gpt_traffic_stats(domain, day desc);`);
+
   console.log("DB initialized");
 }
 
-initDb().catch((err) => {
-  console.error("DB init failed:", err);
-});
+initDb().catch((err) => console.error("DB init failed:", err));
 
 // -------------------- Accounts --------------------
 function loadAccounts() {
@@ -202,7 +198,6 @@ function loadAccounts() {
   if (process.env.SENDGRID_API_KEY_A) accounts.push({ id: "account_a", apiKey: process.env.SENDGRID_API_KEY_A });
   if (process.env.SENDGRID_API_KEY_B) accounts.push({ id: "account_b", apiKey: process.env.SENDGRID_API_KEY_B });
   if (process.env.SENDGRID_API_KEY_C) accounts.push({ id: "account_c", apiKey: process.env.SENDGRID_API_KEY_C });
-
   return accounts;
 }
 
@@ -212,17 +207,18 @@ if (!SENDGRID_ACCOUNTS.length) {
 }
 
 // -------------------- Helpers --------------------
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-function isoNoMs(dt) { return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z"); }
-
-function minAllowedLowerBound() {
-  return new Date(Date.now() - (THIRTY_DAYS_MS - SAFETY_MS));
-}
-function clampLowerBound(dt) {
-  const rollingFloor = new Date(Date.now() - ROLLING_WINDOW_MS);
-  return dt < rollingFloor ? rollingFloor : dt;
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
+function isoNoMs(dt) {
+  return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function clampRollingFloor(dt, anchorMs) {
+  const floor = new Date(anchorMs - ROLLING_WINDOW_MS);
+  return dt < floor ? floor : dt;
+}
 
 function makeEventKey({ sgAccount, sgMessageId, event, eventTs, email }) {
   const base = [
@@ -255,7 +251,11 @@ async function sgFetch(account, method, path, body, attempt = 0) {
   if (res.ok) {
     const txt = await res.text();
     if (!txt) return {};
-    try { return JSON.parse(txt); } catch { return { raw: txt }; }
+    try {
+      return JSON.parse(txt);
+    } catch {
+      return { raw: txt };
+    }
   }
 
   const txt = await res.text();
@@ -263,7 +263,7 @@ async function sgFetch(account, method, path, body, attempt = 0) {
 
   const retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
   if (retryable && attempt < 6) {
-    const backoff = Math.min(30000, 500 * Math.pow(2, attempt));
+    const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
     console.warn(`[SendGrid Retry] ${account.id} ${method} ${path} status=${res.status} backoff=${backoff}ms`);
     await sleep(backoff);
     return sgFetch(account, method, path, body, attempt + 1);
@@ -273,11 +273,11 @@ async function sgFetch(account, method, path, body, attempt = 0) {
 }
 
 // -------------------- Poll state --------------------
-async function getLastSeen(sgAccount) {
+async function getLastSeen(sgAccount, anchorMs) {
   const r = await pool.query(`select last_seen from sg_poll_state where sg_account = $1`, [sgAccount]);
   if (r.rows.length) return new Date(r.rows[0].last_seen);
 
-  const seed = new Date(Date.now() - ROLLING_WINDOW_MS);
+  const seed = new Date(anchorMs - ROLLING_WINDOW_MS);
   await pool.query(
     `insert into sg_poll_state (sg_account, last_seen) values ($1, $2)
      on conflict (sg_account) do nothing`,
@@ -295,8 +295,8 @@ async function setLastSeen(sgAccount, dt) {
 }
 
 // -------------------- Search IDs in window --------------------
-async function sgSearchMessageIds(account, sinceDt, untilDt) {
-  const since = clampLowerBound(sinceDt);
+async function sgSearchMessageIds(account, sinceDt, untilDt, anchorMs) {
+  const since = clampRollingFloor(sinceDt, anchorMs);
   const until = new Date(untilDt);
 
   const sinceStr = isoNoMs(since);
@@ -414,26 +414,28 @@ async function hydrateOneMessage(account, sgMessageId) {
 
   if (!normalizedEvents.length) {
     const now = new Date();
-    return [{
-      event_key: makeEventKey({ sgAccount: account.id, sgMessageId, event: "log", eventTs: now, email }),
-      sg_account: account.id,
-      sg_event_id: null,
-      sg_message_id: sgMessageId,
-      event_ts: now,
-      event: "log",
-      ip: detail?.ip || null,
-      email,
-      recipient_domain: recipientDomain,
-      reason: detail?.reason || null,
-      response: detail?.response || null,
-      status: detail?.status || null,
-      sending_domain: ca.sending_domain || null,
-      stream: ca.stream || null,
-      campaign: ca.campaign || null,
-      ip_pool: ca.ip_pool || null,
-      environment: ca.environment || null,
-      raw: detail,
-    }];
+    return [
+      {
+        event_key: makeEventKey({ sgAccount: account.id, sgMessageId, event: "log", eventTs: now, email }),
+        sg_account: account.id,
+        sg_event_id: null,
+        sg_message_id: sgMessageId,
+        event_ts: now,
+        event: "log",
+        ip: detail?.ip || null,
+        email,
+        recipient_domain: recipientDomain,
+        reason: detail?.reason || null,
+        response: detail?.response || null,
+        status: detail?.status || null,
+        sending_domain: ca.sending_domain || null,
+        stream: ca.stream || null,
+        campaign: ca.campaign || null,
+        ip_pool: ca.ip_pool || null,
+        environment: ca.environment || null,
+        raw: detail,
+      },
+    ];
   }
 
   const out = [];
@@ -483,15 +485,10 @@ async function hydrateAndStore(account, sgMessageIds, progressCb) {
   let hydrated = 0;
   let inserted = 0;
 
-  // Single writer client (serial DB writes = no deadlocks)
+  // Single writer (serial DB writes = avoids deadlocks)
   const writer = await pool.connect();
+  writer.on("error", (err) => console.error("[PG Client Error]", err));
 
-client.on("error", (err) => {
-  console.error("[PG Client Error]", err);
-});
-
-
-  // Simple async queue for rows to write
   const queue = [];
   let doneProducing = false;
   let writerError = null;
@@ -517,7 +514,7 @@ client.on("error", (err) => {
   try {
     let idx = 0;
 
-    const workers = new Array(Math.max(1, HYDRATE_CONCURRENCY)).fill(null).map(async () => {
+    const workers = new Array(HYDRATE_CONCURRENCY).fill(null).map(async () => {
       while (true) {
         if (writerError) throw writerError;
 
@@ -528,11 +525,7 @@ client.on("error", (err) => {
         hydrated += 1;
 
         const rows = await hydrateOneMessage(account, sgMessageId);
-
-        // Enqueue rows for the single writer
-        for (const row of rows) {
-          queue.push(row);
-        }
+        for (const row of rows) queue.push(row);
 
         if (PER_REQUEST_DELAY_MS) await sleep(PER_REQUEST_DELAY_MS);
 
@@ -546,7 +539,6 @@ client.on("error", (err) => {
     doneProducing = true;
 
     await writerPromise;
-
     if (writerError) throw writerError;
   } finally {
     doneProducing = true;
@@ -556,14 +548,13 @@ client.on("error", (err) => {
   return { hydrated, inserted };
 }
 
-
 // -------------------- Window splitting --------------------
-async function processWindowRecursive(account, sinceDt, untilDt) {
-  const since = clampLowerBound(sinceDt);
+async function processWindowRecursive(account, sinceDt, untilDt, anchorMs) {
+  const since = clampRollingFloor(sinceDt, anchorMs);
   const until = new Date(untilDt);
   const windowMs = until.getTime() - since.getTime();
 
-  const search = await sgSearchMessageIds(account, since, until);
+  const search = await sgSearchMessageIds(account, since, until, anchorMs);
 
   // If we hit the ceiling, split. If we can't split further, DO NOT hydrate (reliability first).
   if (search.count >= SG_LOGS_LIMIT) {
@@ -572,123 +563,43 @@ async function processWindowRecursive(account, sinceDt, untilDt) {
         `[Poll] ${account.id} SATURATED at min window since=${search.sinceStr} until=${search.untilStr} count=${search.count} -> skipping hydrate and advancing cursor`
       );
 
-      // Tell caller to advance cursor so we don't stall forever.
-      const suggestedAdvanceTo = new Date(until.getTime()); // advance to end of this min-window slice
-
       return {
         foundMessages: search.count,
         hydrated: 0,
         inserted: 0,
         capped: true,
-        suggestedAdvanceTo,
+        suggestedAdvanceTo: new Date(until.getTime()),
       };
     }
 
     const mid = new Date(since.getTime() + Math.floor(windowMs / 2));
-    const left = await processWindowRecursive(account, since, mid);
-    const right = await processWindowRecursive(account, mid, until);
+    const left = await processWindowRecursive(account, since, mid, anchorMs);
+    const right = await processWindowRecursive(account, mid, until, anchorMs);
 
     return {
       foundMessages: (left.foundMessages || 0) + (right.foundMessages || 0),
       hydrated: (left.hydrated || 0) + (right.hydrated || 0),
       inserted: (left.inserted || 0) + (right.inserted || 0),
       capped: Boolean(left.capped || right.capped),
-      // If either side suggests advancing, use the furthest suggestion
       suggestedAdvanceTo: [left.suggestedAdvanceTo, right.suggestedAdvanceTo]
         .filter(Boolean)
         .sort((a, b) => b.getTime() - a.getTime())[0],
     };
   }
 
-  // Below the ceiling: hydrate normally
+  // Below ceiling: hydrate
   const store = await hydrateAndStore(account, search.ids, null);
   return { foundMessages: search.count, ...store, capped: false, suggestedAdvanceTo: null };
 }
 
-// -------------------- Backfill runner (fire-and-forget) --------------------
-async function createBackfillRun(days, note) {
-  const runId = crypto.randomUUID();
-  await pool.query(`insert into backfill_runs (run_id, days, note) values ($1, $2, $3)`, [runId, days, note || null]);
-  return runId;
-
-}
-
-async function backfillAccountLastNDays(account, days, runId) {
-  const now = new Date();
-  const start = clampLowerBound(new Date(now.getTime() - days * 24 * 60 * 60 * 1000));
-
-  let cursor = new Date(start);
-  let windowsDone = 0;
-
-  while (cursor < now) {
-    const dayEnd = new Date(Math.min(cursor.getTime() + 24 * 60 * 60 * 1000, now.getTime()));
-    windowsDone += 1;
-
-    await pool.query(
-      `
-      update backfill_runs
-      set
-        current_account = $2,
-        current_window_start = $3,
-        current_window_end = $4,
-        windows_done = $5
-      where run_id = $1
-      `,
-      [runId, account.id, cursor, dayEnd, windowsDone]
-    );
-
-    console.log(`[Backfill] ${account.id} ${isoNoMs(cursor)} → ${isoNoMs(dayEnd)}`);
-
-    try {
-      const r = await processWindowRecursive(account, cursor, dayEnd);
-      await pool.query(
-        `
-        update backfill_runs
-        set
-          messages_found = messages_found + $2,
-          hydrated = hydrated + $3,
-          inserted = inserted + $4
-        where run_id = $1
-        `,
-        [runId, Number(r.foundMessages || 0), Number(r.hydrated || 0), Number(r.inserted || 0)]
-      );
-    } catch (err) {
-      console.error(`[Backfill] window failed ${account.id}:`, err);
-      await pool.query(`update backfill_runs set errors = errors + 1 where run_id = $1`, [runId]);
-    }
-
-    cursor = dayEnd;
-    await sleep(200);
-  }
-}
-
-async function runBackfillAll(days, note) {
-  const d = Math.min(Number(days || 2), 2);
-  const runId = await createBackfillRun(d, note || "manual");
-
-  try {
-    for (const acct of SENDGRID_ACCOUNTS) {
-      await backfillAccountLastNDays(acct, d, runId);
-    }
-    await pool.query(`update backfill_runs set status='success', finished_at=now() where run_id=$1`, [runId]);
-    console.log(`[Backfill] DONE run_id=${runId}`);
-  } catch (err) {
-    console.error("[Backfill] FAILED:", err);
-    await pool.query(
-      `update backfill_runs set status='failed', finished_at=now(), note=$2 where run_id=$1`,
-      [runId, String(err?.message || err)]
-    );
-  }
-}
-
-// -------------------- Maintenance: delete >90 days --------------------
+// -------------------- Retention --------------------
 async function cleanupOldData() {
   const r = await pool.query(`delete from sendgrid_events where event_ts < now() - interval '30 days'`);
   return r.rowCount || 0;
 }
 
 // -------------------- Routes --------------------
-app.get("/health", async (req, res) => {
+app.get("/health", async (_req, res) => {
   try {
     await pool.query("select 1 as ok");
     res.status(200).send("ok");
@@ -698,10 +609,6 @@ app.get("/health", async (req, res) => {
   }
 });
 
-
-
-
-
 app.get("/admin/db-info", async (req, res) => {
   if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
 
@@ -710,11 +617,9 @@ app.get("/admin/db-info", async (req, res) => {
   info.schema = (await pool.query("select current_schema() as schema")).rows[0].schema;
   info.search_path = (await pool.query("show search_path")).rows[0].search_path;
 
-  // Which sendgrid_events does Postgres resolve?
   const reg = await pool.query("select to_regclass('sendgrid_events') as resolved");
   info.resolved_table = reg.rows[0].resolved;
 
-  // Where are all sendgrid_events tables?
   const t = await pool.query(`
     select table_schema, table_name
     from information_schema.tables
@@ -723,7 +628,6 @@ app.get("/admin/db-info", async (req, res) => {
   `);
   info.all_tables = t.rows;
 
-  // Does the resolved table have sg_account?
   const c = await pool.query(`
     select column_name
     from information_schema.columns
@@ -735,71 +639,69 @@ app.get("/admin/db-info", async (req, res) => {
   res.json({ ok: true, info });
 });
 
-
-
 // Admin: incremental poll (cursor -> now)
 app.post("/admin/poll", async (req, res) => {
   if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
 
-  // One lock for the entire poll run (prevents overlapping cron runs)
+  // Prevent overlapping cron runs
   const lockId = 987654321;
   const lock = await pool.query("select pg_try_advisory_lock($1) as locked", [lockId]);
-  if (!lock.rows[0].locked) {
-    return res.status(409).json({ ok: false, error: "poll already running" });
-  }
+  if (!lock.rows[0].locked) return res.status(409).json({ ok: false, error: "poll already running" });
 
   const results = [];
   try {
-    // Use DB time to avoid app clock skew (prevents future last_seen issues)
+    // Use DB time to avoid app clock skew
     const dbNow = await pool.query("select now() as now");
     const until = new Date(dbNow.rows[0].now);
+    const anchorMs = until.getTime();
 
-    const rollingFloor = new Date(until.getTime() - ROLLING_WINDOW_MS);
+    // Hard guard: never query earlier than ~30 days (SendGrid constraint)
+    const thirtyDayFloor = new Date(anchorMs - (THIRTY_DAYS_MS - SAFETY_MS));
+    const rollingFloor = new Date(anchorMs - ROLLING_WINDOW_MS);
 
     for (const acct of SENDGRID_ACCOUNTS) {
       try {
-        const lastSeen = await getLastSeen(acct.id);
+        const lastSeen = await getLastSeen(acct.id, anchorMs);
 
-        // Never re-ingest older than 48h
+        // Never re-ingest older than rolling window; also respect 30-day hard floor.
         let since = lastSeen < rollingFloor ? rollingFloor : lastSeen;
+        if (since < thirtyDayFloor) since = thirtyDayFloor;
 
-        // Safety: if cursor is somehow in the future, clamp since to < until
+        // Safety: prevent invalid time range
         if (since >= until) {
-          const safeSince = new Date(until.getTime() - 60 * 1000); // back up 60s
-          console.warn(
-            `[Safety] ${acct.id} since>=until; clamping since from ${isoNoMs(since)} to ${isoNoMs(safeSince)}`
-          );
+          const safeSince = new Date(anchorMs - 60_000);
+          console.warn(`[Safety] ${acct.id} since>=until; clamping since from ${isoNoMs(since)} to ${isoNoMs(safeSince)}`);
           since = safeSince;
         }
 
         console.log(`[Poll] ${acct.id} since=${isoNoMs(since)} until=${isoNoMs(until)}`);
 
-       // Process in small chunks so we can advance cursor even if a later chunk fails
-const CHUNK_MS = 5 * 60 * 1000; // 5 minutes
-let cursor = new Date(since);
-let agg = { foundMessages: 0, hydrated: 0, inserted: 0, capped: false };
+        let cursor = new Date(since);
+        const agg = { foundMessages: 0, hydrated: 0, inserted: 0, capped: false };
 
-while (cursor < until) {
-  const chunkEnd = new Date(Math.min(cursor.getTime() + CHUNK_MS, until.getTime()));
+        while (cursor < until) {
+          const chunkEnd = new Date(Math.min(cursor.getTime() + CHUNK_MS, until.getTime()));
 
-  const r = await processWindowRecursive(acct, cursor, chunkEnd);
+          const r = await processWindowRecursive(acct, cursor, chunkEnd, anchorMs);
 
-  // Aggregate metrics
-  agg.foundMessages += Number(r.foundMessages || 0);
-  agg.hydrated += Number(r.hydrated || 0);
-  agg.inserted += Number(r.inserted || 0);
-  agg.capped = Boolean(agg.capped || r.capped);
+          agg.foundMessages += Number(r.foundMessages || 0);
+          agg.hydrated += Number(r.hydrated || 0);
+          agg.inserted += Number(r.inserted || 0);
+          agg.capped = Boolean(agg.capped || r.capped);
 
-  // Advance cursor: if saturated suggested a safe jump, honor it
-  const nextCursor = r.suggestedAdvanceTo ? new Date(r.suggestedAdvanceTo) : chunkEnd;
+          const nextCursor = r.suggestedAdvanceTo ? new Date(r.suggestedAdvanceTo) : chunkEnd;
 
-  await setLastSeen(acct.id, nextCursor); // commit progress
-  cursor = nextCursor;
-}
+          // Commit progress as we go
+          await setLastSeen(acct.id, nextCursor);
 
-
-        // Advance cursor to DB-time "until" (not app time)
-        await setLastSeen(acct.id, until);
+          // Ensure forward progress even if timestamps collide
+          if (nextCursor.getTime() <= cursor.getTime()) {
+            cursor = new Date(cursor.getTime() + 1000);
+            await setLastSeen(acct.id, cursor);
+          } else {
+            cursor = nextCursor;
+          }
+        }
 
         results.push({ account: acct.id, ok: true, since: isoNoMs(since), until: isoNoMs(until), ...agg });
       } catch (err) {
@@ -807,35 +709,26 @@ while (cursor < until) {
       }
     }
 
-    // Retention: keep only 30 days
     await cleanupOldData();
-
     return res.json({ ok: true, results });
   } finally {
-    // Always release the lock
     await pool.query("select pg_advisory_unlock($1)", [lockId]);
   }
 });
 
-
-// Admin: fire-and-forget backfill (<=30 days) — DISABLED
+// Backfill / maintenance disabled (by design)
 app.post("/admin/backfill", (req, res) => {
   if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
   return res.status(410).json({ ok: false, error: "Backfill permanently disabled" });
 });
-
-// Admin: backfill status — DISABLED (optional: keep if you want visibility into old runs)
 app.get("/admin/backfill-status", (req, res) => {
   if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
   return res.status(410).json({ ok: false, error: "Backfill permanently disabled" });
 });
-
-// Admin: maintenance — DISABLED
 app.post("/admin/maintenance", (req, res) => {
   if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
   return res.status(410).json({ ok: false, error: "Maintenance disabled" });
 });
-
 
 // Admin: cleanup only
 app.post("/admin/cleanup", async (req, res) => {
@@ -844,22 +737,19 @@ app.post("/admin/cleanup", async (req, res) => {
   res.json({ ok: true, deleted });
 });
 
-
+// Admin: Gmail Postmaster Tools pull (daily)
 app.post("/admin/gpt/pull", async (req, res) => {
-  if (!authAdmin(req)) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
+  if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
 
   try {
     requireGptEnv();
 
     const days = Math.min(Math.max(Number(req.body?.days || 14), 1), 30);
 
-    // Use DB time (stable)
     const dbNow = await pool.query("select now() as now");
     const anchor = new Date(dbNow.rows[0].now);
 
-    // GPT data is daily; pull up to yesterday
+    // GPT is daily; pull up to yesterday
     const end = new Date(anchor);
     end.setUTCDate(end.getUTCDate() - 1);
 
@@ -884,27 +774,23 @@ app.post("/admin/gpt/pull", async (req, res) => {
           if (typeof d === "string") {
             dayStr = d.slice(0, 10);
           } else if (d?.year && d?.month && d?.day) {
-            dayStr = `${d.year}-${String(d.month).padStart(2,"0")}-${String(d.day).padStart(2,"0")}`;
+            dayStr = `${d.year}-${String(d.month).padStart(2, "0")}-${String(d.day).padStart(2, "0")}`;
           }
 
-          if (dayStr) {
-            await upsertGptDay(domain, dayStr, item);
-          }
+          if (dayStr) await upsertGptDay(domain, dayStr, item);
         }
 
         results.push({ domain, ok: true, rows: stats.length });
       } catch (e) {
-        results.push({ domain, ok: false, error: String(e.message || e) });
+        results.push({ domain, ok: false, error: String(e?.message || e) });
       }
     }
 
     res.json({ ok: true, startDate, endDate, results });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-
-
 
 // -------------------- Start --------------------
 app.listen(PORT, "0.0.0.0", () => {
