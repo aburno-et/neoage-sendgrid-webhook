@@ -821,6 +821,9 @@ app.post("/admin/poll", async (req, res) => {
         const agg = { foundMessages: 0, hydrated: 0, inserted: 0, capped: false };
         let stoppedEarly = false;
 
+                // Adaptive chunk size must live OUTSIDE the loop so it can shrink across retries
+        let chunkMs = CHUNK_MS; // starts at POLL_CHUNK_MS (default 5m), shrinks on timeouts
+
         while (cursor < until) {
           // Stop early if we’re approaching the runtime budget (prevents lock backlog)
           if (Date.now() - startedAt > MAX_RUNTIME_MS) {
@@ -829,11 +832,61 @@ app.post("/admin/poll", async (req, res) => {
             break;
           }
 
-          let chunkMs = CHUNK_MS; // adaptive per account/run
+          const chunkEnd = new Date(Math.min(cursor.getTime() + chunkMs, until.getTime()));
 
-// ...
+          try {
+            const r = await withTimeout(
+              processWindowRecursive(acct, cursor, chunkEnd, anchorMs),
+              CHUNK_TIMEOUT_MS,
+              `${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}`
+            );
 
-const chunkEnd = new Date(Math.min(cursor.getTime() + chunkMs, until.getTime()));
+            agg.foundMessages += Number(r.foundMessages || 0);
+            agg.hydrated += Number(r.hydrated || 0);
+            agg.inserted += Number(r.inserted || 0);
+            agg.capped = Boolean(agg.capped || r.capped);
+
+            const nextCursor = r.suggestedAdvanceTo ? new Date(r.suggestedAdvanceTo) : chunkEnd;
+
+            // Commit progress as we go (so a later chunk failure doesn't lose prior work)
+            await setLastSeen(acct.id, nextCursor);
+
+            // Ensure forward progress even if timestamps collide
+            if (nextCursor.getTime() <= cursor.getTime()) {
+              cursor = new Date(cursor.getTime() + 1000);
+              await setLastSeen(acct.id, cursor);
+            } else {
+              cursor = nextCursor;
+            }
+
+            // If we succeeded after earlier shrinkage, gradually increase again (up to CHUNK_MS)
+            if (chunkMs < CHUNK_MS) {
+              chunkMs = Math.min(CHUNK_MS, Math.floor(chunkMs * 2));
+            }
+          } catch (e) {
+            const msg = String(e?.message || e);
+            console.error(`[Poll] chunk failed ${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}: ${msg}`);
+
+            agg.capped = true;
+
+            // If it was a timeout, shrink the chunk and retry immediately
+            if (msg.includes("timeout after")) {
+              const newChunkMs = Math.max(15_000, Math.floor(chunkMs / 2)); // down to 15s
+              if (newChunkMs < chunkMs) {
+                console.warn(
+                  `[Poll] ${acct.id} timeout -> shrinking chunk ${chunkMs}ms → ${newChunkMs}ms and retrying`
+                );
+                chunkMs = newChunkMs;
+                continue; // retry same cursor with smaller window
+              }
+            }
+
+            // If not recoverable by shrinking, advance past this chunk so we don't deadlock forever.
+            await setLastSeen(acct.id, chunkEnd);
+            cursor = chunkEnd;
+          }
+        }
+
 
 
           try {
