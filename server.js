@@ -3,7 +3,12 @@
 const express = require("express");
 const { Pool } = require("pg");
 const crypto = require("crypto");
-const { OAuth2Client } = require("google-auth-library");
+let OAuth2Client;
+function loadGoogleAuth() {
+  if (!OAuth2Client) {
+    ({ OAuth2Client } = require("google-auth-library"));
+  }
+}
 
 // Node 18+ has global fetch (Render uses Node 25 in your logs)
 
