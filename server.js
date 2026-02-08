@@ -914,18 +914,31 @@ app.post("/admin/gpt/pull", async (req, res) => {
        let loggedSample = false;
 
 for (const item of stats) {
-  // Try the common v1 shape first: TrafficStats.deliveryDay
-  // Then try a few defensive shapes if your data is wrapped.
+let dayStr = null;
+
+// Primary (your current response): name ends with YYYYMMDD
+// Example: "domains/dinfacil.net/trafficStats/20260125"
+if (item && typeof item.name === "string") {
+  const m = item.name.match(/\/trafficStats\/(\d{8})$/);
+  if (m && m[1]) {
+    const yyyymmdd = m[1];
+    dayStr =
+      yyyymmdd.slice(0, 4) +
+      "-" +
+      yyyymmdd.slice(4, 6) +
+      "-" +
+      yyyymmdd.slice(6, 8);
+  }
+}
+
+// Fallbacks if Google returns Date messages in other shapes
+if (!dayStr) {
   const d =
     (item && item.deliveryDay) ||
     (item && item.date) ||
     (item && item.day) ||
     (item && item.trafficStat && (item.trafficStat.deliveryDay || item.trafficStat.date || item.trafficStat.day)) ||
-    (item && item.trafficStats && item.trafficStats.deliveryDay) ||
-    (item && item.trafficStats && item.trafficStats.date) ||
     null;
-
-  let dayStr = null;
 
   if (typeof d === "string") {
     dayStr = d.slice(0, 10);
@@ -936,23 +949,14 @@ for (const item of stats) {
       String(d.month).padStart(2, "0") +
       "-" +
       String(d.day).padStart(2, "0");
-  } else {
-    missingDate++;
-
-    // Log a single sample per domain so we can see the real shape.
-    if (!loggedSample) {
-      loggedSample = true;
-      try {
-        console.log("[GPT] missing date. domain=", domain);
-        console.log("[GPT] item keys=", Object.keys(item || {}));
-        console.log("[GPT] sample item=", JSON.stringify(item || {}, null, 2));
-      } catch (e) {
-        console.log("[GPT] sample logging failed:", String((e && e.message) || e));
-      }
-    }
-
-    continue;
   }
+}
+
+if (!dayStr) {
+  missingDate++;
+  continue;
+}
+
 
   await upsertGptDay(domain, dayStr, item);
   written++;
