@@ -845,7 +845,7 @@ app.post("/admin/cleanup", async (req, res) => {
   res.json({ ok: true, deleted });
 });
 
-```js
+
 
 
 
@@ -856,7 +856,7 @@ app.post("/admin/gpt/pull", async (req, res) => {
   try {
     requireGptEnv();
 
-    const days = Math.min(Math.max(Number(req.body?.days || 14), 1), 30);
+    const days = Math.min(Math.max(Number((req.body && req.body.days) || 14), 1), 30);
 
     // Use DB time to avoid app clock skew
     const dbNow = await pool.query("select now() as now");
@@ -870,43 +870,53 @@ app.post("/admin/gpt/pull", async (req, res) => {
     const start = new Date(end);
     start.setUTCDate(start.getUTCDate() - (days - 1));
 
-    // Strings for response payload (Grafana-friendly)
+    // Strings for response payload/logging (Grafana-friendly)
     const startDateStr = start.toISOString().slice(0, 10);
     const endDateStr = end.toISOString().slice(0, 10);
 
-    /**
- * UPDATED fetchGptTrafficStats signature:
- * - startDate/endDate must be Date-message objects (NOT strings)
- * - they must be in the POST body, not query params
- */
-async function fetchGptTrafficStats(domain, startDate, endDate, accessToken) {
-  const url = `https://gmailpostmastertools.googleapis.com/v1/domains/${encodeURIComponent(domain)}/trafficStats:query`;
+    // Date objects required by Gmail Postmaster Tools API
+    const startDateObj = toGptDate(start);
+    const endDateObj = toGptDate(end);
 
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ startDate, endDate }),
-  });
+    const accessToken = await getGptAccessToken();
 
-  const text = await r.text();
-  let json;
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text };
+    const results = [];
+    for (const domain of GPT_DOMAINS) {
+      try {
+        // Uses the TOP-LEVEL fetchGptTrafficStats (POST + JSON body)
+        const data = await fetchGptTrafficStats(domain, startDateObj, endDateObj, accessToken);
+        const stats = (data && data.trafficStats) ? data.trafficStats : [];
+
+        for (const item of stats) {
+          const d = item.date;
+          let dayStr = null;
+
+          if (typeof d === "string") {
+            dayStr = d.slice(0, 10);
+          } else if (d && d.year && d.month && d.day) {
+            // no template literals needed
+            dayStr =
+              String(d.year) +
+              "-" +
+              String(d.month).padStart(2, "0") +
+              "-" +
+              String(d.day).padStart(2, "0");
+          }
+
+          if (dayStr) await upsertGptDay(domain, dayStr, item);
+        }
+
+        results.push({ domain: domain, ok: true, rows: stats.length });
+      } catch (e) {
+        results.push({ domain: domain, ok: false, error: String((e && e.message) || e) });
+      }
+    }
+
+    res.json({ ok: true, startDate: startDateStr, endDate: endDateStr, results });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e) });
   }
-
-  if (!r.ok) {
-    // Preserve Google's useful error payload
-    throw new Error(`GPT API ${r.status}: ${typeof json === "object" ? JSON.stringify(json, null, 2) : String(text)}`);
-  }
-
-  return json;
-}
-```
+});
 
 
 
