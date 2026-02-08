@@ -262,6 +262,7 @@ async function sgFetch(account, method, path, body, attempt = 0) {
     body: body ? JSON.stringify(body) : undefined,
   });
 
+  // Success
   if (res.ok) {
     const txt = await res.text();
     if (!txt) return {};
@@ -272,9 +273,18 @@ async function sgFetch(account, method, path, body, attempt = 0) {
     }
   }
 
+  // Error body
   const txt = await res.text();
   const msg = txt ? txt.slice(0, 800) : "";
 
+  // Some message_ids returned by /v3/logs search may be unavailable when hydrated.
+  // Do not fail the whole poll on a single missing message.
+  if (res.status === 404 && method === "GET" && path.startsWith("/v3/logs/")) {
+    console.warn(`[SendGrid Skip] ${account.id} ${method} ${path} -> 404 not found`);
+    return {};
+  }
+
+  // Retry on throttling / transient server errors
   const retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
   if (retryable && attempt < 6) {
     const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
@@ -673,7 +683,18 @@ app.post("/admin/poll", async (req, res) => {
     const thirtyDayFloor = new Date(anchorMs - (THIRTY_DAYS_MS - SAFETY_MS));
     const rollingFloor = new Date(anchorMs - ROLLING_WINDOW_MS);
 
+    // Hardening: bound the runtime so one poll can't hold the lock for ages
+    // (keep under cron curl --max-time)
+    const startedAt = Date.now();
+    const MAX_RUNTIME_MS = 90 * 1000; // 90s
+
     for (const acct of SENDGRID_ACCOUNTS) {
+      // Stop early if we’re approaching the runtime budget (prevents lock backlog)
+      if (Date.now() - startedAt > MAX_RUNTIME_MS) {
+        console.warn("[Poll] Max runtime reached; stopping early to avoid overlap/backlog.");
+        break;
+      }
+
       try {
         const lastSeen = await getLastSeen(acct.id, anchorMs);
 
@@ -684,7 +705,9 @@ app.post("/admin/poll", async (req, res) => {
         // Safety: prevent invalid time range
         if (since >= until) {
           const safeSince = new Date(anchorMs - 60_000);
-          console.warn(`[Safety] ${acct.id} since>=until; clamping since from ${isoNoMs(since)} to ${isoNoMs(safeSince)}`);
+          console.warn(
+            `[Safety] ${acct.id} since>=until; clamping since from ${isoNoMs(since)} to ${isoNoMs(safeSince)}`
+          );
           since = safeSince;
         }
 
@@ -692,10 +715,17 @@ app.post("/admin/poll", async (req, res) => {
 
         let cursor = new Date(since);
         const agg = { foundMessages: 0, hydrated: 0, inserted: 0, capped: false };
+        let stoppedEarly = false;
 
         while (cursor < until) {
-          const chunkEnd = new Date(Math.min(cursor.getTime() + CHUNK_MS, until.getTime()));
+          // Stop early if we’re approaching the runtime budget (prevents lock backlog)
+          if (Date.now() - startedAt > MAX_RUNTIME_MS) {
+            console.warn(`[Poll] Max runtime reached mid-run for ${acct.id}; pausing at ${isoNoMs(cursor)}.`);
+            stoppedEarly = true;
+            break;
+          }
 
+          const chunkEnd = new Date(Math.min(cursor.getTime() + CHUNK_MS, until.getTime()));
           const r = await processWindowRecursive(acct, cursor, chunkEnd, anchorMs);
 
           agg.foundMessages += Number(r.foundMessages || 0);
@@ -705,7 +735,7 @@ app.post("/admin/poll", async (req, res) => {
 
           const nextCursor = r.suggestedAdvanceTo ? new Date(r.suggestedAdvanceTo) : chunkEnd;
 
-          // Commit progress as we go
+          // Commit progress as we go (so a later chunk failure doesn't lose prior work)
           await setLastSeen(acct.id, nextCursor);
 
           // Ensure forward progress even if timestamps collide
@@ -717,7 +747,14 @@ app.post("/admin/poll", async (req, res) => {
           }
         }
 
-        results.push({ account: acct.id, ok: true, since: isoNoMs(since), until: isoNoMs(until), ...agg });
+        results.push({
+          account: acct.id,
+          ok: true,
+          since: isoNoMs(since),
+          until: isoNoMs(until),
+          stoppedEarly,
+          ...agg,
+        });
       } catch (err) {
         results.push({ account: acct.id, ok: false, error: String(err?.message || err) });
       }
@@ -729,6 +766,7 @@ app.post("/admin/poll", async (req, res) => {
     await pool.query("select pg_advisory_unlock($1)", [lockId]);
   }
 });
+
 
 // Backfill / maintenance disabled (by design)
 app.post("/admin/backfill", (req, res) => {
