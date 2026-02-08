@@ -874,61 +874,7 @@ app.post("/admin/gpt/pull", async (req, res) => {
     const startDateStr = start.toISOString().slice(0, 10);
     const endDateStr = end.toISOString().slice(0, 10);
 
-    // Date objects for GPT API
-    const startDate = toGptDate(start);
-    const endDate = toGptDate(end);
-
-    const accessToken = await getGptAccessToken();
-
-    const results = [];
-    for (const domain of GPT_DOMAINS) {
-      try {
-        const data = await fetchGptTrafficStats(domain, startDate, endDate, accessToken);
-
-        // trafficStats is usually the response field, but keep it defensive
-        const stats = data.trafficStats || data.traffic_stats || [];
-
-        for (const item of stats) {
-          const d = item.date;
-          let dayStr = null;
-
-          if (typeof d === "string") {
-            dayStr = d.slice(0, 10);
-          } else if (d && d.year && d.month && d.day) {
-            // Avoid template literals to eliminate any parsing surprises
-            dayStr =
-              String(d.year) +
-              "-" +
-              String(d.month).padStart(2, "0") +
-              "-" +
-              String(d.day).padStart(2, "0");
-          }
-
-          if (dayStr) await upsertGptDay(domain, dayStr, item);
-        }
-
-        results.push({ domain, ok: true, rows: stats.length });
-      } catch (e) {
-        results.push({ domain, ok: false, error: String(e?.message || e) });
-      }
-    }
-
-    res.json({ ok: true, startDate: startDateStr, endDate: endDateStr, results });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-
-/**
- * Convert a JS Date (UTC) into the Gmail Postmaster Tools Date message shape.
- * API requires: { year: number, month: number (1-12), day: number (1-31) }
- */
-function toGptDate(dt) {
-  return { year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate() };
-}
-
-/**
+    /**
  * UPDATED fetchGptTrafficStats signature:
  * - startDate/endDate must be Date-message objects (NOT strings)
  * - they must be in the POST body, not query params
@@ -961,6 +907,17 @@ async function fetchGptTrafficStats(domain, startDate, endDate, accessToken) {
   return json;
 }
 ```
+
+
+
+/**
+ * Convert a JS Date (UTC) into the Gmail Postmaster Tools Date message shape.
+ * API requires: { year: number, month: number (1-12), day: number (1-31) }
+ */
+function toGptDate(dt) {
+  return { year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate() };
+}
+
 
 // -------------------- Start --------------------
 app.listen(PORT, "0.0.0.0", () => {
