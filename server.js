@@ -672,6 +672,15 @@ app.post("/admin/poll", async (req, res) => {
   const lock = await pool.query("select pg_try_advisory_lock($1) as locked", [lockId]);
   if (!lock.rows[0].locked) return res.status(409).json({ ok: false, error: "poll already running" });
 
+  // Helper: enforce timeouts on awaited work so we never hold the lock indefinitely
+  function withTimeout(promise, ms, label) {
+    let t;
+    const timeout = new Promise((_, reject) => {
+      t = setTimeout(() => reject(new Error(`timeout after ${ms}ms: ${label}`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+  }
+
   const results = [];
   try {
     // Use DB time to avoid app clock skew
@@ -684,9 +693,11 @@ app.post("/admin/poll", async (req, res) => {
     const rollingFloor = new Date(anchorMs - ROLLING_WINDOW_MS);
 
     // Hardening: bound the runtime so one poll can't hold the lock for ages
-    // (keep under cron curl --max-time)
     const startedAt = Date.now();
     const MAX_RUNTIME_MS = 90 * 1000; // 90s
+
+    // Per-chunk timeout. Must be < MAX_RUNTIME_MS, and typically < cron --max-time.
+    const CHUNK_TIMEOUT_MS = 75 * 1000; // 75s
 
     for (const acct of SENDGRID_ACCOUNTS) {
       // Stop early if we’re approaching the runtime budget (prevents lock backlog)
@@ -726,24 +737,43 @@ app.post("/admin/poll", async (req, res) => {
           }
 
           const chunkEnd = new Date(Math.min(cursor.getTime() + CHUNK_MS, until.getTime()));
-          const r = await processWindowRecursive(acct, cursor, chunkEnd, anchorMs);
 
-          agg.foundMessages += Number(r.foundMessages || 0);
-          agg.hydrated += Number(r.hydrated || 0);
-          agg.inserted += Number(r.inserted || 0);
-          agg.capped = Boolean(agg.capped || r.capped);
+          try {
+            const r = await withTimeout(
+              processWindowRecursive(acct, cursor, chunkEnd, anchorMs),
+              CHUNK_TIMEOUT_MS,
+              `${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}`
+            );
 
-          const nextCursor = r.suggestedAdvanceTo ? new Date(r.suggestedAdvanceTo) : chunkEnd;
+            agg.foundMessages += Number(r.foundMessages || 0);
+            agg.hydrated += Number(r.hydrated || 0);
+            agg.inserted += Number(r.inserted || 0);
+            agg.capped = Boolean(agg.capped || r.capped);
 
-          // Commit progress as we go (so a later chunk failure doesn't lose prior work)
-          await setLastSeen(acct.id, nextCursor);
+            const nextCursor = r.suggestedAdvanceTo ? new Date(r.suggestedAdvanceTo) : chunkEnd;
 
-          // Ensure forward progress even if timestamps collide
-          if (nextCursor.getTime() <= cursor.getTime()) {
-            cursor = new Date(cursor.getTime() + 1000);
-            await setLastSeen(acct.id, cursor);
-          } else {
-            cursor = nextCursor;
+            // Commit progress as we go (so a later chunk failure doesn't lose prior work)
+            await setLastSeen(acct.id, nextCursor);
+
+            // Ensure forward progress even if timestamps collide
+            if (nextCursor.getTime() <= cursor.getTime()) {
+              cursor = new Date(cursor.getTime() + 1000);
+              await setLastSeen(acct.id, cursor);
+            } else {
+              cursor = nextCursor;
+            }
+          } catch (e) {
+            // Critical: do not allow a single bad/hung chunk to stall the poll forever.
+            console.error(
+              `[Poll] chunk failed ${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}: ${String(e?.message || e)}`
+            );
+
+            // Mark degraded and advance past the problematic chunk for reliability.
+            agg.capped = true;
+
+            // Advance cursor and persist it so we don't retry this same bad chunk endlessly.
+            await setLastSeen(acct.id, chunkEnd);
+            cursor = chunkEnd;
           }
         }
 
@@ -766,7 +796,6 @@ app.post("/admin/poll", async (req, res) => {
     await pool.query("select pg_advisory_unlock($1)", [lockId]);
   }
 });
-
 
 // Backfill / maintenance disabled (by design)
 app.post("/admin/backfill", (req, res) => {
