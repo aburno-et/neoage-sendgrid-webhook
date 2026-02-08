@@ -920,13 +920,6 @@ app.post("/admin/gpt/pull", async (req, res) => {
 
 
 
-/**
- * Convert a JS Date (UTC) into the Gmail Postmaster Tools Date message shape.
- * API requires: { year: number, month: number (1-12), day: number (1-31) }
- */
-function toGptDate(dt) {
-  return { year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate() };
-}
 
 
 // -------------------- Start --------------------
