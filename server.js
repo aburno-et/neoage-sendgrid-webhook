@@ -97,20 +97,33 @@ function toGptDate(dt) {
   return { year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate() };
 }
 
-// IMPORTANT: Postmaster Tools trafficStats:query expects POST + JSON body (Date objects), not query params.
+// IMPORTANT (v1): trafficStats is retrieved via LIST, not :query.
+// Uses primitive query params: startDate.year/month/day and endDate.year/month/day.
 async function fetchGptTrafficStats(domain, startDate, endDate, accessToken) {
-  const url =
+  // startDate/endDate must be objects like: { year, month, day }
+  const base =
     "https://gmailpostmastertools.googleapis.com/v1/domains/" +
     encodeURIComponent(domain) +
-    "/trafficStats:query";
+    "/trafficStats";
+
+  const qs = new URLSearchParams({
+    "startDate.year": String(startDate.year),
+    "startDate.month": String(startDate.month),
+    "startDate.day": String(startDate.day),
+    "endDate.year": String(endDate.year),
+    "endDate.month": String(endDate.month),
+    "endDate.day": String(endDate.day),
+    // optional: keep pages reasonable
+    "pageSize": "500",
+  });
+
+  const url = base + "?" + qs.toString();
 
   const res = await fetch(url, {
-    method: "POST",
+    method: "GET",
     headers: {
       Authorization: "Bearer " + accessToken,
-      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ startDate, endDate }),
   });
 
   const text = await res.text();
@@ -125,17 +138,9 @@ async function fetchGptTrafficStats(domain, startDate, endDate, accessToken) {
     throw new Error("GPT API " + res.status + ": " + JSON.stringify(json, null, 2));
   }
 
+  // Normalize: always return an object with trafficStats array
+  // v1 responses generally return { trafficStats: [...], nextPageToken?: "..." }
   return json;
-}
-
-async function upsertGptDay(domain, day, raw) {
-  await pool.query(
-    `insert into gpt_traffic_stats (domain, day, raw)
-     values ($1, $2, $3::jsonb)
-     on conflict (domain, day)
-     do update set raw = excluded.raw, fetched_at = now()`,
-    [domain, day, JSON.stringify(raw)]
-  );
 }
 
 
