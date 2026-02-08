@@ -911,35 +911,53 @@ app.post("/admin/gpt/pull", async (req, res) => {
         let written = 0;
         let missingDate = 0;
 
-        for (const item of stats) {
-          // v1 list() responses usually use deliveryDay (Date message).
-// Keep fallbacks so you don't break if Google changes/you ingest older shapes.
-const d =
-  item.deliveryDay ||
-  item.date ||
-  item.day ||
-  (item.trafficStat && (item.trafficStat.deliveryDay || item.trafficStat.date)) ||
-  null;
+       let loggedSample = false;
 
-          let dayStr = null;
+for (const item of stats) {
+  // Try the common v1 shape first: TrafficStats.deliveryDay
+  // Then try a few defensive shapes if your data is wrapped.
+  const d =
+    (item && item.deliveryDay) ||
+    (item && item.date) ||
+    (item && item.day) ||
+    (item && item.trafficStat && (item.trafficStat.deliveryDay || item.trafficStat.date || item.trafficStat.day)) ||
+    (item && item.trafficStats && item.trafficStats.deliveryDay) ||
+    (item && item.trafficStats && item.trafficStats.date) ||
+    null;
 
-          if (typeof d === "string") {
-            dayStr = d.slice(0, 10);
-          } else if (d && d.year && d.month && d.day) {
-            dayStr =
-              String(d.year) +
-              "-" +
-              String(d.month).padStart(2, "0") +
-              "-" +
-              String(d.day).padStart(2, "0");
-          } else {
-            missingDate++;
-            continue;
-          }
+  let dayStr = null;
 
-          await upsertGptDay(domain, dayStr, item);
-          written++;
-        }
+  if (typeof d === "string") {
+    dayStr = d.slice(0, 10);
+  } else if (d && d.year && d.month && d.day) {
+    dayStr =
+      String(d.year) +
+      "-" +
+      String(d.month).padStart(2, "0") +
+      "-" +
+      String(d.day).padStart(2, "0");
+  } else {
+    missingDate++;
+
+    // Log a single sample per domain so we can see the real shape.
+    if (!loggedSample) {
+      loggedSample = true;
+      try {
+        console.log("[GPT] missing date. domain=", domain);
+        console.log("[GPT] item keys=", Object.keys(item || {}));
+        console.log("[GPT] sample item=", JSON.stringify(item || {}, null, 2));
+      } catch (e) {
+        console.log("[GPT] sample logging failed:", String((e && e.message) || e));
+      }
+    }
+
+    continue;
+  }
+
+  await upsertGptDay(domain, dayStr, item);
+  written++;
+}
+
 
         results.push({ domain: domain, ok: true, rows: stats.length, written: written, missingDate: missingDate });
       } catch (e) {
