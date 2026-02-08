@@ -298,17 +298,45 @@ function authAdmin(req) {
   return ADMIN_TOKEN && token === ADMIN_TOKEN;
 }
 
-// -------------------- SendGrid fetch (retries) --------------------
+
+// -------------------- SendGrid fetch (retries + hard timeout) --------------------
 async function sgFetch(account, method, path, body, attempt = 0) {
   const url = `https://api.sendgrid.com${path}`;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      Authorization: `Bearer ${account.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+
+  // Hard timeout for the HTTP request itself (prevents hung sockets)
+  const HTTP_TIMEOUT_MS = Number(process.env.SG_HTTP_TIMEOUT_MS || 60000); // 60s default
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method,
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${account.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+
+    // Retry aborts/timeouts/transient fetch failures
+    const msg = String(e?.name || "") + " " + String(e?.message || e);
+    const retryable = msg.includes("AbortError") || msg.includes("timeout") || msg.includes("ECONNRESET");
+
+    if (retryable && attempt < 6) {
+      const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
+      console.warn(`[SendGrid Retry] ${account.id} ${method} ${path} fetch-failed backoff=${backoff}ms err=${msg}`);
+      await sleep(backoff);
+      return sgFetch(account, method, path, body, attempt + 1);
+    }
+
+    throw new Error(`SendGrid fetch failed (${account.id}) ${method} ${path}: ${msg}`);
+  } finally {
+    clearTimeout(timer);
+  }
 
   // Success
   if (res.ok) {
@@ -326,7 +354,6 @@ async function sgFetch(account, method, path, body, attempt = 0) {
   const msg = txt ? txt.slice(0, 800) : "";
 
   // Some message_ids returned by /v3/logs search may be unavailable when hydrated.
-  // Do not fail the whole poll on a single missing message.
   if (res.status === 404 && method === "GET" && path.startsWith("/v3/logs/")) {
     console.warn(`[SendGrid Skip] ${account.id} ${method} ${path} -> 404 not found`);
     return {};
@@ -343,6 +370,7 @@ async function sgFetch(account, method, path, body, attempt = 0) {
 
   throw new Error(`SendGrid API error (${account.id}) ${res.status}: ${msg}`);
 }
+
 
 // -------------------- Poll state --------------------
 async function getLastSeen(sgAccount, anchorMs) {
@@ -759,10 +787,10 @@ app.post("/admin/poll", async (req, res) => {
 
     // Hardening: bound the runtime so one poll can't hold the lock for ages
     const startedAt = Date.now();
-    const MAX_RUNTIME_MS = 90 * 1000; // 90s
+    const MAX_RUNTIME_MS = Number(process.env.POLL_MAX_RUNTIME_MS || 240000);     // 4 minutes
 
     // Per-chunk timeout. Must be < MAX_RUNTIME_MS, and typically < cron --max-time.
-    const CHUNK_TIMEOUT_MS = 75 * 1000; // 75s
+  const CHUNK_TIMEOUT_MS = Number(process.env.POLL_CHUNK_TIMEOUT_MS || 180000); // 3 minutes
 
     for (const acct of SENDGRID_ACCOUNTS) {
       // Stop early if we’re approaching the runtime budget (prevents lock backlog)
@@ -801,7 +829,12 @@ app.post("/admin/poll", async (req, res) => {
             break;
           }
 
-          const chunkEnd = new Date(Math.min(cursor.getTime() + CHUNK_MS, until.getTime()));
+          let chunkMs = CHUNK_MS; // adaptive per account/run
+
+// ...
+
+const chunkEnd = new Date(Math.min(cursor.getTime() + chunkMs, until.getTime()));
+
 
           try {
             const r = await withTimeout(
@@ -828,18 +861,28 @@ app.post("/admin/poll", async (req, res) => {
               cursor = nextCursor;
             }
           } catch (e) {
-            // Critical: do not allow a single bad/hung chunk to stall the poll forever.
-            console.error(
-              `[Poll] chunk failed ${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}: ${String(e?.message || e)}`
-            );
+  const msg = String(e?.message || e);
+  console.error(
+    `[Poll] chunk failed ${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}: ${msg}`
+  );
 
-            // Mark degraded and advance past the problematic chunk for reliability.
-            agg.capped = true;
+  agg.capped = true;
 
-            // Advance cursor and persist it so we don't retry this same bad chunk endlessly.
-            await setLastSeen(acct.id, chunkEnd);
-            cursor = chunkEnd;
-          }
+  // If it was a timeout, shrink the chunk and retry ONCE immediately.
+  if (msg.includes("timeout after")) {
+    const newChunkMs = Math.max(15_000, Math.floor(chunkMs / 2)); // down to 15s
+    if (newChunkMs < chunkMs) {
+      console.warn(`[Poll] ${acct.id} timeout -> shrinking chunk ${chunkMs}ms → ${newChunkMs}ms and retrying`);
+      chunkMs = newChunkMs;
+      continue; // retry same cursor with smaller window
+    }
+  }
+
+  // If not recoverable by shrinking, advance past this chunk so we don't deadlock forever.
+  await setLastSeen(acct.id, chunkEnd);
+  cursor = chunkEnd;
+}
+
         }
 
         results.push({
