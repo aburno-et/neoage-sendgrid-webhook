@@ -22,6 +22,7 @@ function loadGoogleAuth() {
 
 // -------------------- App --------------------
 const app = express();
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "5mb" }));
 
 // Hardening: keep the process alive through transient errors
@@ -243,6 +244,13 @@ async function initDb() {
 }
 
 initDb().catch((err) => console.error("DB init failed:", err));
+
+console.log("[Startup sanity]", {
+  PORT,
+  hasDatabaseUrl: Boolean(DATABASE_URL),
+  sendgridAccounts: SENDGRID_ACCOUNTS.length,
+  gptDomains: GPT_DOMAINS.length,
+});
 
 // -------------------- Accounts --------------------
 function loadAccounts() {
@@ -790,7 +798,7 @@ app.post("/admin/poll", async (req, res) => {
     const MAX_RUNTIME_MS = Number(process.env.POLL_MAX_RUNTIME_MS || 240000);     // 4 minutes
 
     // Per-chunk timeout. Must be < MAX_RUNTIME_MS, and typically < cron --max-time.
-  const CHUNK_TIMEOUT_MS = Number(process.env.POLL_CHUNK_TIMEOUT_MS || 180000); // 3 minutes
+    const CHUNK_TIMEOUT_MS = Number(process.env.POLL_CHUNK_TIMEOUT_MS || 180000); // 3 minutes
 
     for (const acct of SENDGRID_ACCOUNTS) {
       // Stop early if we’re approaching the runtime budget (prevents lock backlog)
