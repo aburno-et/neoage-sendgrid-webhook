@@ -912,7 +912,15 @@ app.post("/admin/gpt/pull", async (req, res) => {
         let missingDate = 0;
 
         for (const item of stats) {
-          const d = item.date;
+          // v1 list() responses usually use deliveryDay (Date message).
+// Keep fallbacks so you don't break if Google changes/you ingest older shapes.
+const d =
+  item.deliveryDay ||
+  item.date ||
+  item.day ||
+  (item.trafficStat && (item.trafficStat.deliveryDay || item.trafficStat.date)) ||
+  null;
+
           let dayStr = null;
 
           if (typeof d === "string") {
