@@ -905,9 +905,11 @@ app.post("/admin/gpt/pull", async (req, res) => {
     const results = [];
     for (const domain of GPT_DOMAINS) {
       try {
-        // Uses the TOP-LEVEL fetchGptTrafficStats (POST + JSON body)
         const data = await fetchGptTrafficStats(domain, startDateObj, endDateObj, accessToken);
         const stats = (data && data.trafficStats) ? data.trafficStats : [];
+
+        let written = 0;
+        let missingDate = 0;
 
         for (const item of stats) {
           const d = item.date;
@@ -916,19 +918,22 @@ app.post("/admin/gpt/pull", async (req, res) => {
           if (typeof d === "string") {
             dayStr = d.slice(0, 10);
           } else if (d && d.year && d.month && d.day) {
-            // no template literals needed
             dayStr =
               String(d.year) +
               "-" +
               String(d.month).padStart(2, "0") +
               "-" +
               String(d.day).padStart(2, "0");
+          } else {
+            missingDate++;
+            continue;
           }
 
-          if (dayStr) await upsertGptDay(domain, dayStr, item);
+          await upsertGptDay(domain, dayStr, item);
+          written++;
         }
 
-        results.push({ domain: domain, ok: true, rows: stats.length });
+        results.push({ domain: domain, ok: true, rows: stats.length, written: written, missingDate: missingDate });
       } catch (e) {
         results.push({ domain: domain, ok: false, error: String((e && e.message) || e) });
       }
@@ -939,6 +944,7 @@ app.post("/admin/gpt/pull", async (req, res) => {
     res.status(500).json({ ok: false, error: String((e && e.message) || e) });
   }
 });
+
 
 
 
