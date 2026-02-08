@@ -889,56 +889,7 @@ app.post("/admin/poll", async (req, res) => {
 
 
 
-          try {
-            const r = await withTimeout(
-              processWindowRecursive(acct, cursor, chunkEnd, anchorMs),
-              CHUNK_TIMEOUT_MS,
-              `${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}`
-            );
-
-            agg.foundMessages += Number(r.foundMessages || 0);
-            agg.hydrated += Number(r.hydrated || 0);
-            agg.inserted += Number(r.inserted || 0);
-            agg.capped = Boolean(agg.capped || r.capped);
-
-            const nextCursor = r.suggestedAdvanceTo ? new Date(r.suggestedAdvanceTo) : chunkEnd;
-
-            // Commit progress as we go (so a later chunk failure doesn't lose prior work)
-            await setLastSeen(acct.id, nextCursor);
-
-            // Ensure forward progress even if timestamps collide
-            if (nextCursor.getTime() <= cursor.getTime()) {
-              cursor = new Date(cursor.getTime() + 1000);
-              await setLastSeen(acct.id, cursor);
-            } else {
-              cursor = nextCursor;
-            }
-          } catch (e) {
-  const msg = String(e?.message || e);
-  console.error(
-    `[Poll] chunk failed ${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}: ${msg}`
-  );
-
-  agg.capped = true;
-
-  // If it was a timeout, shrink the chunk and retry ONCE immediately.
-  if (msg.includes("timeout after")) {
-    const newChunkMs = Math.max(15_000, Math.floor(chunkMs / 2)); // down to 15s
-    if (newChunkMs < chunkMs) {
-      console.warn(`[Poll] ${acct.id} timeout -> shrinking chunk ${chunkMs}ms → ${newChunkMs}ms and retrying`);
-      chunkMs = newChunkMs;
-      continue; // retry same cursor with smaller window
-    }
-  }
-
-  // If not recoverable by shrinking, advance past this chunk so we don't deadlock forever.
-  await setLastSeen(acct.id, chunkEnd);
-  cursor = chunkEnd;
-}
-
-        }
-
-        results.push({
+                results.push({
           account: acct.id,
           ok: true,
           since: isoNoMs(since),
