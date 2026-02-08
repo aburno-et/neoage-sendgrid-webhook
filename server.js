@@ -3,12 +3,20 @@
 const express = require("express");
 const { Pool } = require("pg");
 const crypto = require("crypto");
-let OAuth2Client;
+// Lazy-load Google auth so missing deps never prevent SendGrid ingestion from running
+let OAuth2Client = null;
 function loadGoogleAuth() {
-  if (!OAuth2Client) {
+  if (OAuth2Client) return;
+  try {
     ({ OAuth2Client } = require("google-auth-library"));
+  } catch (e) {
+    const msg = String(e?.message || e);
+    throw new Error(
+      `google-auth-library is not installed. Add it to package.json dependencies and redeploy. Original error: ${msg}`
+    );
   }
 }
+
 
 // Node 18+ has global fetch (Render uses Node 25 in your logs)
 
@@ -76,7 +84,8 @@ function requireGptEnv() {
 }
 
 async function getGptAccessToken() {
-  const oauth2 = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
+ loadGoogleAuth();  
+const oauth2 = new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET);
   oauth2.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
   const { token } = await oauth2.getAccessToken();
   if (!token) throw new Error("Failed to obtain GPT access token");
