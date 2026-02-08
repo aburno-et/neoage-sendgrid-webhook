@@ -695,6 +695,23 @@ app.get("/admin/db-info", async (req, res) => {
   res.json({ ok: true, info });
 });
 
+
+
+app.get("/admin/db/whoami", async (req, res) => {
+  if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  const r = await pool.query(`
+    select
+      current_database() as db,
+      current_user as user,
+      inet_server_addr() as server_ip,
+      inet_server_port() as server_port,
+      now() as now
+  `);
+  res.json({ ok: true, ...r.rows[0] });
+});
+
+
+
 // Admin: incremental poll (cursor -> now)
 app.post("/admin/poll", async (req, res) => {
   if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
