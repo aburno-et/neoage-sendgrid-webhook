@@ -298,51 +298,81 @@ function authAdmin(req) {
   return ADMIN_TOKEN && token === ADMIN_TOKEN;
 }
 
-// -------------------- SendGrid fetch (retries) --------------------
+
+// -------------------- SendGrid fetch (retries + timeout) --------------------
+const SG_FETCH_TIMEOUT_MS = Number(process.env.SG_FETCH_TIMEOUT_MS || 15000);
+
+function isRetryableNetworkError(err) {
+  const msg = String(err?.message || err);
+  return (
+    err?.name === "AbortError" ||
+    /aborted/i.test(msg) ||
+    /timeout/i.test(msg) ||
+    /ETIMEDOUT/i.test(msg) ||
+    /ECONNRESET/i.test(msg) ||
+    /EAI_AGAIN/i.test(msg) ||
+    /ENOTFOUND/i.test(msg) ||
+    /fetch failed/i.test(msg)
+  );
+}
+
 async function sgFetch(account, method, path, body, attempt = 0) {
   const url = `https://api.sendgrid.com${path}`;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      Authorization: `Bearer ${account.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
 
-  // Success
-  if (res.ok) {
-    const txt = await res.text();
-    if (!txt) return {};
-    try {
-      return JSON.parse(txt);
-    } catch {
-      return { raw: txt };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SG_FETCH_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${account.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+
+    if (res.ok) {
+      const txt = await res.text();
+      if (!txt) return {};
+      try {
+        return JSON.parse(txt);
+      } catch {
+        return { raw: txt };
+      }
     }
+
+    const txt = await res.text();
+    const msg = txt ? txt.slice(0, 800) : "";
+
+    const retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
+    if (retryable && attempt < 6) {
+      const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
+      console.warn(
+        `[SendGrid Retry] ${account.id} ${method} ${path} status=${res.status} backoff=${backoff}ms`
+      );
+      await sleep(backoff);
+      return sgFetch(account, method, path, body, attempt + 1);
+    }
+
+    throw new Error(`SendGrid API error (${account.id}) ${res.status}: ${msg}`);
+  } catch (err) {
+    const retryable = isRetryableNetworkError(err);
+    if (retryable && attempt < 6) {
+      const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
+      console.warn(
+        `[SendGrid Retry] ${account.id} ${method} ${path} network_error=${String(err?.name || "")} backoff=${backoff}ms`
+      );
+      await sleep(backoff);
+      return sgFetch(account, method, path, body, attempt + 1);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  // Error body
-  const txt = await res.text();
-  const msg = txt ? txt.slice(0, 800) : "";
-
-  // Some message_ids returned by /v3/logs search may be unavailable when hydrated.
-  // Do not fail the whole poll on a single missing message.
-  if (res.status === 404 && method === "GET" && path.startsWith("/v3/logs/")) {
-    console.warn(`[SendGrid Skip] ${account.id} ${method} ${path} -> 404 not found`);
-    return {};
-  }
-
-  // Retry on throttling / transient server errors
-  const retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
-  if (retryable && attempt < 6) {
-    const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
-    console.warn(`[SendGrid Retry] ${account.id} ${method} ${path} status=${res.status} backoff=${backoff}ms`);
-    await sleep(backoff);
-    return sgFetch(account, method, path, body, attempt + 1);
-  }
-
-  throw new Error(`SendGrid API error (${account.id}) ${res.status}: ${msg}`);
 }
+
 
 // -------------------- Poll state --------------------
 async function getLastSeen(sgAccount, anchorMs) {
