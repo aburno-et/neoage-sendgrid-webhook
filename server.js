@@ -300,30 +300,24 @@ function authAdmin(req) {
 
 
 // -------------------- SendGrid fetch (retries + timeout) --------------------
-const SG_FETCH_TIMEOUT_MS = Number(process.env.SG_FETCH_TIMEOUT_MS || 15000);
-
-function isRetryableNetworkError(err) {
-  const msg = String(err?.message || err);
-  return (
-    err?.name === "AbortError" ||
-    /aborted/i.test(msg) ||
-    /timeout/i.test(msg) ||
-    /ETIMEDOUT/i.test(msg) ||
-    /ECONNRESET/i.test(msg) ||
-    /EAI_AGAIN/i.test(msg) ||
-    /ENOTFOUND/i.test(msg) ||
-    /fetch failed/i.test(msg)
-  );
-}
+const SG_FETCH_TIMEOUT_MS = Math.max(
+  5_000,
+  Number.isFinite(Number(process.env.SG_FETCH_TIMEOUT_MS))
+    ? Number(process.env.SG_FETCH_TIMEOUT_MS)
+    : 25_000
+); // default 25s, never < 5s
 
 async function sgFetch(account, method, path, body, attempt = 0) {
   const url = `https://api.sendgrid.com${path}`;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), SG_FETCH_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(SG_FETCH_TIMEOUT_MS) ? SG_FETCH_TIMEOUT_MS : 25_000;
 
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res;
   try {
-    const res = await fetch(url, {
+    res = await fetch(url, {
       method,
       headers: {
         Authorization: `Bearer ${account.apiKey}`,
@@ -332,45 +326,46 @@ async function sgFetch(account, method, path, body, attempt = 0) {
       body: body ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
-
-    if (res.ok) {
-      const txt = await res.text();
-      if (!txt) return {};
-      try {
-        return JSON.parse(txt);
-      } catch {
-        return { raw: txt };
-      }
-    }
-
-    const txt = await res.text();
-    const msg = txt ? txt.slice(0, 800) : "";
-
-    const retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
-    if (retryable && attempt < 6) {
-      const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
-      console.warn(
-        `[SendGrid Retry] ${account.id} ${method} ${path} status=${res.status} backoff=${backoff}ms`
-      );
-      await sleep(backoff);
-      return sgFetch(account, method, path, body, attempt + 1);
-    }
-
-    throw new Error(`SendGrid API error (${account.id}) ${res.status}: ${msg}`);
   } catch (err) {
-    const retryable = isRetryableNetworkError(err);
-    if (retryable && attempt < 6) {
+    const isAbort = err?.name === "AbortError";
+    const msg = String(err?.message || err);
+
+    if (attempt < 6) {
       const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
       console.warn(
-        `[SendGrid Retry] ${account.id} ${method} ${path} network_error=${String(err?.name || "")} backoff=${backoff}ms`
+        `[SendGrid Retry] ${account.id} ${method} ${path} network_error=${isAbort ? "AbortError" : "Error"} backoff=${backoff}ms msg=${msg}`
       );
       await sleep(backoff);
       return sgFetch(account, method, path, body, attempt + 1);
     }
-    throw err;
+
+    throw new Error(`SendGrid network error (${account.id}) ${method} ${path}: ${msg}`);
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timeoutId);
   }
+
+  if (res.ok) {
+    const txt = await res.text();
+    if (!txt) return {};
+    try {
+      return JSON.parse(txt);
+    } catch {
+      return { raw: txt };
+    }
+  }
+
+  const txt = await res.text();
+  const msg = txt ? txt.slice(0, 800) : "";
+
+  const retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
+  if (retryable && attempt < 6) {
+    const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
+    console.warn(`[SendGrid Retry] ${account.id} ${method} ${path} status=${res.status} backoff=${backoff}ms`);
+    await sleep(backoff);
+    return sgFetch(account, method, path, body, attempt + 1);
+  }
+
+  throw new Error(`SendGrid API error (${account.id}) ${res.status}: ${msg}`);
 }
 
 
