@@ -311,9 +311,12 @@ async function sgFetch(account, method, path, body, attempt = 0) {
   const url = `https://api.sendgrid.com${path}`;
 
   const controller = new AbortController();
-  const timeoutMs = Number.isFinite(SG_FETCH_TIMEOUT_MS) ? SG_FETCH_TIMEOUT_MS : 25_000;
+  const timeoutMs = SG_FETCH_TIMEOUT_MS;
 
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  // Guard: ensure timeout is a real number (never NaN)
+  const safeTimeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : 25_000;
+
+  const timeoutId = setTimeout(() => controller.abort(), safeTimeoutMs);
 
   let res;
   try {
@@ -327,9 +330,12 @@ async function sgFetch(account, method, path, body, attempt = 0) {
       signal: controller.signal,
     });
   } catch (err) {
+    clearTimeout(timeoutId);
+
     const isAbort = err?.name === "AbortError";
     const msg = String(err?.message || err);
 
+    // Treat aborts/network errors as retryable (like 5xx/429)
     if (attempt < 6) {
       const backoff = Math.min(30_000, 500 * Math.pow(2, attempt));
       console.warn(
@@ -347,11 +353,7 @@ async function sgFetch(account, method, path, body, attempt = 0) {
   if (res.ok) {
     const txt = await res.text();
     if (!txt) return {};
-    try {
-      return JSON.parse(txt);
-    } catch {
-      return { raw: txt };
-    }
+    try { return JSON.parse(txt); } catch { return { raw: txt }; }
   }
 
   const txt = await res.text();
@@ -367,6 +369,7 @@ async function sgFetch(account, method, path, body, attempt = 0) {
 
   throw new Error(`SendGrid API error (${account.id}) ${res.status}: ${msg}`);
 }
+
 
 
 // -------------------- Poll state --------------------
