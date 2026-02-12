@@ -54,7 +54,7 @@ const ROLLING_WINDOW_HOURS = Number(process.env.ROLLING_WINDOW_HOURS || 48);
 const ROLLING_WINDOW_MS = ROLLING_WINDOW_HOURS * 60 * 60 * 1000;
 
 // Chunk the poll so we advance cursor progressively (helps avoid timeouts/stalls)
-const CHUNK_MS = Math.max(30_000, Number(process.env.POLL_CHUNK_MS || 60 * 1000)); // default 5 min
+const CHUNK_MS = Math.max(30_000, Number(process.env.POLL_CHUNK_MS || 60 * 1000)); // default 1 min
 
 // -------------------- Postgres --------------------
 const pool = new Pool({
@@ -787,28 +787,26 @@ app.post("/admin/poll", async (req, res) => {
     const until = new Date(dbNow.rows[0].now);
     const anchorMs = until.getTime();
 
-    // Hard guard: never query earlier than ~30 days (SendGrid constraint)
+  // Hard guard: never query earlier than ~30 days (SendGrid constraint)
     const thirtyDayFloor = new Date(anchorMs - (THIRTY_DAYS_MS - SAFETY_MS));
     const rollingFloor = new Date(anchorMs - ROLLING_WINDOW_MS);
 
-  // Per-chunk timeout. Must be < MAX_RUNTIME_MS, and typically < cron --max-time.
+    // Hardening: bound the runtime so one poll can't hold the lock for ages
+    const startedAt = Date.now();
+    const MAX_RUNTIME_MS = Math.min(300_000, Number(process.env.POLL_MAX_RUNTIME_MS || 240_000));
+
+    // Per-chunk timeout - dynamic based on chunk size (3x chunk duration)
+    const baseChunkTimeout = CHUNK_MS * 3;
     const CHUNK_TIMEOUT_MS = Math.min(
-      90_000,
-      Math.max(10_000, Number(process.env.POLL_CHUNK_TIMEOUT_MS || 75_000))
+      MAX_RUNTIME_MS - 30_000, // Leave 30s buffer for cleanup
+      Math.max(30_000, Number(process.env.POLL_CHUNK_TIMEOUT_MS || baseChunkTimeout))
     );
 
-
-// Dynamic timeout: allow 3x the chunk window duration for processing
-const CHUNK_TIMEOUT_MS = Math.min(
-  MAX_RUNTIME_MS - 10_000, // Must leave buffer for cleanup
-  Math.max(30_000, CHUNK_MS * 3) // 3x chunk size, minimum 30s
-);
-
-    // NEW: after repeated failures, we still advance, but we also keep the poll from "thrashing"
-    const MAX_CONSECUTIVE_FAILS = Math.max(1, Number(process.env.MAX_CONSECUTIVE_FAILS || 3));
+    // After repeated failures, skip forward
+    const MAX_CONSECUTIVE_FAILS = Math.max(1, Number(process.env.MAX_CONSECUTIVE_FAILS || 2));
 
     for (const acct of SENDGRID_ACCOUNTS) {
-      // Stop early if we’re approaching the runtime budget (prevents lock backlog)
+      // Stop early if we're approaching the runtime budget (prevents lock backlog)
       if (Date.now() - startedAt > MAX_RUNTIME_MS) {
         console.warn("[Poll] Max runtime reached; stopping early to avoid overlap/backlog.");
         break;
@@ -840,7 +838,7 @@ const CHUNK_TIMEOUT_MS = Math.min(
         let consecutiveFails = 0;
 
         while (cursor < until) {
-          // Stop early if we’re approaching the runtime budget (prevents lock backlog)
+          // Stop early if we're approaching the runtime budget (prevents lock backlog)
           if (Date.now() - startedAt > MAX_RUNTIME_MS) {
             console.warn(`[Poll] Max runtime reached mid-run for ${acct.id}; pausing at ${isoNoMs(cursor)}.`);
             stoppedEarly = true;
@@ -858,6 +856,12 @@ const CHUNK_TIMEOUT_MS = Math.min(
 
             // NEW: reset fail counter on success
             consecutiveFails = 0;
+
+            // NEW: Log successful chunk processing
+            console.log(
+              `[Poll] ✓ ${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)} ` +
+              `found=${r.foundMessages} hydrated=${r.hydrated} inserted=${r.inserted}`
+            );
 
             agg.foundMessages += Number(r.foundMessages || 0);
             agg.hydrated += Number(r.hydrated || 0);
@@ -908,20 +912,21 @@ const CHUNK_TIMEOUT_MS = Math.min(
         }
 
         results.push({
-  account: acct.id,
-  ok: true,
-  since: isoNoMs(since),
-  until: isoNoMs(until),
-  stoppedEarly,
-  windowSizeMinutes: Math.round((until.getTime() - since.getTime()) / 60000),
-  runtimeSeconds: Math.round((Date.now() - startedAt) / 1000),
-  avgMessagesPerMinute: Math.round(agg.foundMessages / ((until - since) / 60000)),
-  ...agg,
+          account: acct.id,
+          ok: true,
+          since: isoNoMs(since),
+          until: isoNoMs(until),
+          stoppedEarly,
+          windowSizeMinutes: Math.round((until.getTime() - since.getTime()) / 60000),
+          runtimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+          avgMessagesPerMinute: Math.round(agg.foundMessages / Math.max(1, (until.getTime() - since.getTime()) / 60000)),
+          ...agg,
         });
       } catch (err) {
         results.push({ account: acct.id, ok: false, error: String(err?.message || err) });
       }
     }
+
 
     await cleanupOldData();
     return res.json({ ok: true, results });
