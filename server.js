@@ -789,9 +789,14 @@ app.post("/admin/poll", async (req, res) => {
     const startedAt = Date.now();
     const MAX_RUNTIME_MS = Math.min(165_000, Number(process.env.POLL_MAX_RUNTIME_MS || 165_000));
 
-
     // Per-chunk timeout. Must be < MAX_RUNTIME_MS, and typically < cron --max-time.
-    const CHUNK_TIMEOUT_MS = 75 * 1000; // 75s
+    const CHUNK_TIMEOUT_MS = Math.min(
+      90_000,
+      Math.max(10_000, Number(process.env.POLL_CHUNK_TIMEOUT_MS || 75_000))
+    );
+
+    // NEW: after repeated failures, we still advance, but we also keep the poll from "thrashing"
+    const MAX_CONSECUTIVE_FAILS = Math.max(1, Number(process.env.MAX_CONSECUTIVE_FAILS || 3));
 
     for (const acct of SENDGRID_ACCOUNTS) {
       // Stop early if we’re approaching the runtime budget (prevents lock backlog)
@@ -822,6 +827,9 @@ app.post("/admin/poll", async (req, res) => {
         const agg = { foundMessages: 0, hydrated: 0, inserted: 0, capped: false };
         let stoppedEarly = false;
 
+        // NEW: track consecutive failures so we don't get "stuck" hammering the same area
+        let consecutiveFails = 0;
+
         while (cursor < until) {
           // Stop early if we’re approaching the runtime budget (prevents lock backlog)
           if (Date.now() - startedAt > MAX_RUNTIME_MS) {
@@ -838,6 +846,9 @@ app.post("/admin/poll", async (req, res) => {
               CHUNK_TIMEOUT_MS,
               `${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}`
             );
+
+            // NEW: reset fail counter on success
+            consecutiveFails = 0;
 
             agg.foundMessages += Number(r.foundMessages || 0);
             agg.hydrated += Number(r.hydrated || 0);
@@ -857,17 +868,33 @@ app.post("/admin/poll", async (req, res) => {
               cursor = nextCursor;
             }
           } catch (e) {
+            consecutiveFails += 1;
+
             // Critical: do not allow a single bad/hung chunk to stall the poll forever.
             console.error(
-              `[Poll] chunk failed ${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)}: ${String(e?.message || e)}`
+              `[Poll] chunk failed ${acct.id} ${isoNoMs(cursor)}→${isoNoMs(chunkEnd)} (${consecutiveFails}/${MAX_CONSECUTIVE_FAILS}): ${String(
+                e?.message || e
+              )}`
             );
 
-            // Mark degraded and advance past the problematic chunk for reliability.
+            // Mark degraded (this is *not* necessarily "saturated"; it's "degraded reliability")
             agg.capped = true;
 
-            // Advance cursor and persist it so we don't retry this same bad chunk endlessly.
-            await setLastSeen(acct.id, chunkEnd);
-            cursor = chunkEnd;
+            // NEW: after a few consecutive failures, skip forward; otherwise brief pause then retry a bit
+            if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
+              console.warn(
+                `[Poll] skipping window after ${MAX_CONSECUTIVE_FAILS} failures: advancing last_seen to ${isoNoMs(
+                  chunkEnd
+                )}`
+              );
+              await setLastSeen(acct.id, chunkEnd);
+              cursor = chunkEnd;
+              consecutiveFails = 0;
+            } else {
+              // tiny delay to avoid immediate hammering / thundering herd
+              await sleep(500);
+              // keep cursor the same so we retry this chunk a couple times before skipping
+            }
           }
         }
 
@@ -890,6 +917,8 @@ app.post("/admin/poll", async (req, res) => {
     await pool.query("select pg_advisory_unlock($1)", [lockId]);
   }
 });
+
+
 
 // Backfill / maintenance disabled (by design)
 app.post("/admin/backfill", (req, res) => {
