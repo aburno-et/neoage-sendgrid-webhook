@@ -54,13 +54,19 @@ const ROLLING_WINDOW_HOURS = Number(process.env.ROLLING_WINDOW_HOURS || 48);
 const ROLLING_WINDOW_MS = ROLLING_WINDOW_HOURS * 60 * 60 * 1000;
 
 // Chunk the poll so we advance cursor progressively (helps avoid timeouts/stalls)
-const CHUNK_MS = Math.max(60_000, Number(process.env.POLL_CHUNK_MS || 5 * 60 * 1000)); // default 5 min
+const CHUNK_MS = Math.max(30_000, Number(process.env.POLL_CHUNK_MS || 60 * 1000)); // default 5 min
 
 // -------------------- Postgres --------------------
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
+  max: 20,                    // Increase from default 10
+  idleTimeoutMillis: 30000,   // Release idle connections after 30s
+  connectionTimeoutMillis: 5000,
 });
+
+// Increase EventEmitter limit to match pool size
+pool.setMaxListeners(25);
 
 pool.on("error", (err) => {
   console.error("[PG Pool Error]", err);
@@ -785,15 +791,18 @@ app.post("/admin/poll", async (req, res) => {
     const thirtyDayFloor = new Date(anchorMs - (THIRTY_DAYS_MS - SAFETY_MS));
     const rollingFloor = new Date(anchorMs - ROLLING_WINDOW_MS);
 
-    // Hardening: bound the runtime so one poll can't hold the lock for ages
-    const startedAt = Date.now();
-    const MAX_RUNTIME_MS = Math.min(165_000, Number(process.env.POLL_MAX_RUNTIME_MS || 165_000));
-
-    // Per-chunk timeout. Must be < MAX_RUNTIME_MS, and typically < cron --max-time.
+  // Per-chunk timeout. Must be < MAX_RUNTIME_MS, and typically < cron --max-time.
     const CHUNK_TIMEOUT_MS = Math.min(
       90_000,
       Math.max(10_000, Number(process.env.POLL_CHUNK_TIMEOUT_MS || 75_000))
     );
+
+
+// Dynamic timeout: allow 3x the chunk window duration for processing
+const CHUNK_TIMEOUT_MS = Math.min(
+  MAX_RUNTIME_MS - 10_000, // Must leave buffer for cleanup
+  Math.max(30_000, CHUNK_MS * 3) // 3x chunk size, minimum 30s
+);
 
     // NEW: after repeated failures, we still advance, but we also keep the poll from "thrashing"
     const MAX_CONSECUTIVE_FAILS = Math.max(1, Number(process.env.MAX_CONSECUTIVE_FAILS || 3));
@@ -899,12 +908,15 @@ app.post("/admin/poll", async (req, res) => {
         }
 
         results.push({
-          account: acct.id,
-          ok: true,
-          since: isoNoMs(since),
-          until: isoNoMs(until),
-          stoppedEarly,
-          ...agg,
+  account: acct.id,
+  ok: true,
+  since: isoNoMs(since),
+  until: isoNoMs(until),
+  stoppedEarly,
+  windowSizeMinutes: Math.round((until.getTime() - since.getTime()) / 60000),
+  runtimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+  avgMessagesPerMinute: Math.round(agg.foundMessages / ((until - since) / 60000)),
+  ...agg,
         });
       } catch (err) {
         results.push({ account: acct.id, ok: false, error: String(err?.message || err) });
