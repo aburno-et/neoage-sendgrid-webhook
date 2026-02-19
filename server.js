@@ -793,7 +793,7 @@ app.post("/admin/poll", async (req, res) => {
 
     // Hardening: bound the runtime so one poll can't hold the lock for ages
     const startedAt = Date.now();
-    const MAX_RUNTIME_MS = Math.min(300_000, Number(process.env.POLL_MAX_RUNTIME_MS || 240_000));
+    const MAX_RUNTIME_MS = Number(process.env.POLL_MAX_RUNTIME_MS || 240_000);
 
     // Per-chunk timeout - dynamic based on chunk size (3x chunk duration)
     const baseChunkTimeout = CHUNK_MS * 3;
