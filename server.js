@@ -60,14 +60,13 @@ const CHUNK_MS = Math.max(30_000, Number(process.env.POLL_CHUNK_MS || 60 * 1000)
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 20,                    // Increase from default 10
-  idleTimeoutMillis: 30000,   // Release idle connections after 30s
-  connectionTimeoutMillis: 5000,
+  max: Number(process.env.DATABASE_MAX_CONNECTIONS || 25),  // Increased
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+  maxUses: 7500
 });
 
-// Increase EventEmitter limit to match pool size
-pool.setMaxListeners(25);
-
+pool.setMaxListeners(30);  // Increase from 25
 pool.on("error", (err) => {
   console.error("[PG Pool Error]", err);
 });
