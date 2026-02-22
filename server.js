@@ -169,34 +169,31 @@ async function upsertGptDay(domain, dayStr, item) {
 
 // -------------------- DB init --------------------
 async function initDb() {
-  await pool.query(`
+ await pool.query(`
     create table if not exists sendgrid_events (
       id bigserial primary key,
       received_at timestamptz not null default now(),
       event_key text unique,
-
       sg_account text,
       sg_event_id text,
       sg_message_id text,
-
       event_ts timestamptz,
-
       event text not null,
       ip inet,
       email text,
       recipient_domain text,
-
       reason text,
       response text,
       status text,
-
       sending_domain text,
       stream text,
       campaign text,
       ip_pool text,
       environment text,
-
-      raw jsonb not null
+      country text,
+      utm_source text,
+      email_type text,
+      project text
     );
   `);
 
@@ -430,24 +427,11 @@ async function sgSearchMessageIds(account, sinceDt, untilDt, anchorMs) {
 // -------------------- Hydrate + upsert --------------------
 async function upsertEventRow(client, row) {
   const {
-    event_key,
-    sg_account,
-    sg_event_id,
-    sg_message_id,
-    event_ts,
-    event,
-    ip,
-    email,
-    recipient_domain,
-    reason,
-    response,
-    status,
-    sending_domain,
-    stream,
-    campaign,
-    ip_pool,
-    environment,
-    raw,
+    event_key, sg_account, sg_event_id, sg_message_id,
+    event_ts, event, ip, email, recipient_domain,
+    reason, response, status,
+    sending_domain, stream, campaign, ip_pool, environment,
+    country, utm_source, email_type, project,
   } = row;
 
   await client.query(
@@ -458,50 +442,36 @@ async function upsertEventRow(client, row) {
       event_ts, event, ip, email, recipient_domain,
       reason, response, status,
       sending_domain, stream, campaign, ip_pool, environment,
-      raw
+      country, utm_source, email_type, project
     )
     values (
-      $1,
-      $2, $3, $4,
-      $5, $6, $7, $8, $9,
-      $10, $11, $12,
-      $13, $14, $15, $16, $17,
-      $18::jsonb
+      $1, $2, $3, $4, $5, $6, $7, $8, $9,
+      $10, $11, $12, $13, $14, $15, $16, $17,
+      $18, $19, $20, $21
     )
-    on conflict (event_key) do update
-    set
-      sg_event_id     = excluded.sg_event_id,
-      event_ts        = excluded.event_ts,
-      ip              = excluded.ip,
-      reason          = excluded.reason,
-      response        = excluded.response,
-      status          = excluded.status,
-      sending_domain  = excluded.sending_domain,
-      stream          = excluded.stream,
-      campaign        = excluded.campaign,
-      ip_pool         = excluded.ip_pool,
-      environment     = excluded.environment,
-      raw             = excluded.raw
+    on conflict (event_key) do update set
+      sg_event_id    = excluded.sg_event_id,
+      event_ts       = excluded.event_ts,
+      ip             = excluded.ip,
+      reason         = excluded.reason,
+      response       = excluded.response,
+      status         = excluded.status,
+      sending_domain = excluded.sending_domain,
+      stream         = excluded.stream,
+      campaign       = excluded.campaign,
+      ip_pool        = excluded.ip_pool,
+      environment    = excluded.environment,
+      country        = excluded.country,
+      utm_source     = excluded.utm_source,
+      email_type     = excluded.email_type,
+      project        = excluded.project
     `,
     [
-      event_key,
-      sg_account,
-      sg_event_id,
-      sg_message_id,
-      event_ts,
-      event,
-      ip,
-      email,
-      recipient_domain,
-      reason,
-      response,
-      status,
-      sending_domain,
-      stream,
-      campaign,
-      ip_pool,
-      environment,
-      JSON.stringify(raw),
+      event_key, sg_account, sg_event_id, sg_message_id,
+      event_ts, event, ip, email, recipient_domain,
+      reason, response, status,
+      sending_domain, stream, campaign, ip_pool, environment,
+      country, utm_source, email_type, project,
     ]
   );
 }
@@ -516,32 +486,41 @@ async function hydrateOneMessage(account, sgMessageId) {
   const recipientDomain =
     typeof email === "string" && email.includes("@") ? email.split("@").pop().toLowerCase() : null;
 
-  const ca = detail?.custom_args || detail?.unique_args || {};
+ const ca = detail?.custom_args || detail?.unique_args || {};
+
+  // Extract all fields we need directly - no more raw storage
+  const outboundIp = detail?.outbound_ip || null;
+  const country = ca.country || null;
+  const utmSource = ca.utm_source || null;
+  const emailType = ca.email_type || ca['emaiç_type'] || null; // handle upstream typo
+  const project = ca.project || null;
+  const sendingDomain = detail?.from_email || ca.sending_domain || null;
 
   if (!normalizedEvents.length) {
     const now = new Date();
-    return [
-      {
-        event_key: makeEventKey({ sgAccount: account.id, sgMessageId, event: "log", eventTs: now, email }),
-        sg_account: account.id,
-        sg_event_id: null,
-        sg_message_id: sgMessageId,
-        event_ts: now,
-        event: "log",
-        ip: detail?.ip || null,
-        email,
-        recipient_domain: recipientDomain,
-        reason: detail?.reason || null,
-        response: detail?.response || null,
-        status: detail?.status || null,
-        sending_domain: ca.sending_domain || null,
-        stream: ca.stream || null,
-        campaign: ca.campaign || null,
-        ip_pool: ca.ip_pool || null,
-        environment: ca.environment || null,
-        raw: detail,
-      },
-    ];
+    return [{
+      event_key: makeEventKey({ sgAccount: account.id, sgMessageId, event: "log", eventTs: now, email }),
+      sg_account: account.id,
+      sg_event_id: null,
+      sg_message_id: sgMessageId,
+      event_ts: now,
+      event: "log",
+      ip: outboundIp || detail?.ip || null,
+      email,
+      recipient_domain: recipientDomain,
+      reason: detail?.reason || null,
+      response: detail?.response || null,
+      status: detail?.status || null,
+      sending_domain: sendingDomain,
+      stream: ca.stream || null,
+      campaign: ca.campaign || null,
+      ip_pool: ca.ip_pool || null,
+      environment: ca.environment || null,
+      country,
+      utm_source: utmSource,
+      email_type: emailType,
+      project,
+    }];
   }
 
   const out = [];
@@ -555,32 +534,30 @@ async function hydrateOneMessage(account, sgMessageId) {
     else if (typeof ev?.timestamp === "string") ts = new Date(ev.timestamp);
     else ts = new Date();
 
-    const ip = ev?.ip || detail?.ip || null;
-    const reason = ev?.reason || detail?.reason || null;
-    const response = ev?.response || detail?.response || null;
-    const status = ev?.status || detail?.status || null;
-
-    const eventKey = makeEventKey({ sgAccount: account.id, sgMessageId, event: eventName, eventTs: ts, email });
+    const evCa = ev?.custom_args || ev?.unique_args || {};
 
     out.push({
-      event_key: eventKey,
+      event_key: makeEventKey({ sgAccount: account.id, sgMessageId, event: eventName, eventTs: ts, email }),
       sg_account: account.id,
       sg_event_id: ev?.sg_event_id || detail?.sg_event_id || null,
       sg_message_id: sgMessageId,
       event_ts: ts,
       event: eventName,
-      ip,
+      ip: ev?.ip || outboundIp || detail?.ip || null,
       email,
       recipient_domain: recipientDomain,
-      reason,
-      response,
-      status,
-      sending_domain: ca.sending_domain || null,
-      stream: ca.stream || null,
-      campaign: ca.campaign || null,
-      ip_pool: ca.ip_pool || null,
-      environment: ca.environment || null,
-      raw: { detail, ev },
+      reason: ev?.reason || detail?.reason || null,
+      response: ev?.response || detail?.response || null,
+      status: ev?.status || detail?.status || null,
+      sending_domain: sendingDomain,
+      stream: ca.stream || evCa.stream || null,
+      campaign: ca.campaign || evCa.campaign || null,
+      ip_pool: ca.ip_pool || evCa.ip_pool || null,
+      environment: ca.environment || evCa.environment || null,
+      country: ca.country || evCa.country || null,
+      utm_source: ca.utm_source || evCa.utm_source || null,
+      email_type: ca.email_type || ca['emaiç_type'] || evCa.email_type || null,
+      project: ca.project || evCa.project || null,
     });
   }
 
@@ -700,7 +677,7 @@ async function processWindowRecursive(account, sinceDt, untilDt, anchorMs) {
 
 // -------------------- Retention --------------------
 async function cleanupOldData() {
-  const r = await pool.query(`delete from sendgrid_events where event_ts < now() - interval '30 days'`);
+  const r = await pool.query(`delete from sendgrid_events where event_ts < now() - interval '7 days'`);
   return r.rowCount || 0;
 }
 
