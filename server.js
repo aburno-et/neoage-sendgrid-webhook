@@ -60,13 +60,14 @@ const CHUNK_MS = Math.max(30_000, Number(process.env.POLL_CHUNK_MS || 60 * 1000)
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: Number(process.env.DATABASE_MAX_CONNECTIONS || 25),  // Increased
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-  maxUses: 7500
+  max: 20,                    // Increase from default 10
+  idleTimeoutMillis: 30000,   // Release idle connections after 30s
+  connectionTimeoutMillis: 5000,
 });
 
-pool.setMaxListeners(30);  // Increase from 25
+// Increase EventEmitter limit to match pool size
+pool.setMaxListeners(25);
+
 pool.on("error", (err) => {
   console.error("[PG Pool Error]", err);
 });
@@ -769,7 +770,7 @@ app.post("/admin/poll", async (req, res) => {
 
     // Hardening: bound the runtime so one poll can't hold the lock for ages
     const startedAt = Date.now();
-    const MAX_RUNTIME_MS = Number(process.env.POLL_MAX_RUNTIME_MS || 240_000);
+    const MAX_RUNTIME_MS = Math.min(300_000, Number(process.env.POLL_MAX_RUNTIME_MS || 240_000));
 
     // Per-chunk timeout - dynamic based on chunk size (3x chunk duration)
     const baseChunkTimeout = CHUNK_MS * 3;
