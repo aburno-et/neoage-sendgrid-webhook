@@ -937,6 +937,37 @@ app.post("/admin/cleanup", async (req, res) => {
 
 
 
+// Reset Stalled Cursors
+
+app.post("/admin/reset-stale-cursors", async (req, res) => {
+  if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  const r = await pool.query(`
+    UPDATE sg_poll_state
+    SET last_seen = NOW() - INTERVAL '24 hours'
+    WHERE last_seen < NOW() - INTERVAL '24 hours'
+  `);
+  res.json({ ok: true, updated: r.rowCount });
+});
+
+
+
+
+
+// Get Account Cursor Status
+
+app.get("/admin/status", async (req, res) => {
+  if (!authAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  const r = await pool.query(`
+    SELECT sg_account, last_seen,
+      ROUND(EXTRACT(EPOCH FROM (NOW() - last_seen))/3600, 1) AS hours_behind
+    FROM sg_poll_state
+    ORDER BY sg_account
+  `);
+  const size = await pool.query(`SELECT pg_size_pretty(pg_total_relation_size('sendgrid_events')) AS size`);
+  res.json({ ok: true, accounts: r.rows, db_size: size.rows[0].size });
+});
+
+
 
 
 // Admin: Gmail Postmaster Tools pull (daily)
