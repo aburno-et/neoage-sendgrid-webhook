@@ -28,8 +28,7 @@ import psycopg2.extras
 import requests
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
-MIN_SENDS        = 100
-MIN_DELIVERY_PCT = 98.0
+MIN_SENDS        = 1000MIN_DELIVERY_PCT = 98.0
 MIN_OPEN_PCT     = 50.0
 MAX_SPAM_PCT     = 0.1
 
@@ -44,6 +43,8 @@ QUERY = """
 WITH yesterday AS (
     SELECT
         campaign,
+        project,
+        email_type,
         COUNT(*) FILTER (WHERE event = 'processed')   AS sends,
         COUNT(*) FILTER (WHERE event = 'delivered')   AS delivered,
         COUNT(*) FILTER (WHERE event = 'open')        AS opened,
@@ -54,10 +55,12 @@ WITH yesterday AS (
         AND event_ts >= (CURRENT_DATE - INTERVAL '1 day')
         AND event_ts <   CURRENT_DATE
         AND campaign IS NOT NULL
-    GROUP BY campaign
+    GROUP BY campaign, project, email_type
 )
 SELECT
     campaign,
+    project,
+    email_type,
     sends,
     delivered,
     opened,
@@ -101,6 +104,7 @@ def build_slack_block(row: dict, breaches: list[str], report_date: date) -> dict
             "type": "mrkdwn",
             "text": (
                 f"*Campaign:* `{row['campaign']}`\n"
+                f"*Project:* {row['project'] or '—'}  |  *Email Type:* {row['email_type'] or '—'}\n"
                 f"*Date:* {report_date}  |  *Country:* ar  |  "
                 f"*Sends:* {row['sends']:,}\n"
                 f"{breach_text}"
@@ -134,7 +138,7 @@ def send_slack_alert(alerts: list[dict], report_date: date) -> None:
                 {
                     "type": "mrkdwn",
                     "text": (
-                        f"Evaluated {len(alerts)} campaign(s) with >{MIN_SENDS} sends. "
+                        f"Evaluated {len(alerts)} campaign(s) with >{MIN_SENDS:,} sends. "
                         f"Thresholds: delivery ≥{MIN_DELIVERY_PCT}% | "
                         f"open ≥{MIN_OPEN_PCT}% | spam ≤{MAX_SPAM_PCT}%"
                     ),
