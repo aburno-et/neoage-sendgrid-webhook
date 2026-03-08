@@ -13,7 +13,7 @@ Environment variables (set in Render / your cron environment):
     SLACK_WEBHOOK  — Slack Incoming Webhook URL
 
 Thresholds (edit below if needed):
-    MIN_SENDS        = 100     minimum recipients to trigger evaluation
+    MIN_SENDS        = 1000     minimum recipients to trigger evaluation
     MIN_DELIVERY_PCT = 98.0    delivery rate must be >= this
     MIN_OPEN_PCT     = 50.0    open rate must be >= this
     MAX_SPAM_PCT     = 0.1     spam rate must be <= this
@@ -28,7 +28,8 @@ import psycopg2.extras
 import requests
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
-MIN_SENDS        = 1000MIN_DELIVERY_PCT = 98.0
+MIN_SENDS        = 1000
+MIN_DELIVERY_PCT = 98.0
 MIN_OPEN_PCT     = 50.0
 MAX_SPAM_PCT     = 0.1
 
