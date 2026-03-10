@@ -551,7 +551,7 @@ async function hydrateOneMessage(account, sgMessageId) {
       status: ev?.status || detail?.status || null,
       sending_domain: sendingDomain,
       stream: ca.stream || evCa.stream || null,
-      campaign: ca.clickupid || ca.campaign || evCa.clickupid || evCa.campaign || null,
+      campaign: evCa.clickupid || ca.clickupid || evCa.campaign || ca.campaign || null,
       ip_pool: ca.ip_pool || evCa.ip_pool || null,
       environment: ca.environment || evCa.environment || null,
       country: ca.country || evCa.country || null,
