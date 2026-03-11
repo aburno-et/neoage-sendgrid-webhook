@@ -494,7 +494,7 @@ async function hydrateOneMessage(account, sgMessageId) {
   const outboundIp = detail?.outbound_ip || null;
   const country = ca.country || null;
   const utmSource = ca.utm_source || null;
-  const emailType = ca.email_type || ca['emaiç_type'] || null; // handle upstream typo
+  const emailType = ca.mail_type || ca.email_type || ca['emaiç_type'] || null; // handle upstream typo
   const project = ca.project || null;
   const sendingDomain = detail?.from_email || ca.sending_domain || null;
 
@@ -560,7 +560,7 @@ clickup_id: evCa.clickupid || ca.clickupid || null,
       environment: ca.environment || evCa.environment || null,
       country: ca.country || evCa.country || null,
       utm_source: ca.utm_source || evCa.utm_source || null,
-      email_type: ca.email_type || ca['emaiç_type'] || evCa.email_type || null,
+      email_type: evCa.mail_type || ca.mail_type || evCa.email_type || ca.email_type || ca['emaiç_type'] || null,
       project: ca.project || evCa.project || null,
     });
   }
