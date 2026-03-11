@@ -677,7 +677,7 @@ async function processWindowRecursive(account, sinceDt, untilDt, anchorMs) {
 
 // -------------------- Retention --------------------
 async function cleanupOldData() {
-  const r = await pool.query(`delete from sendgrid_events where event_ts < now() - interval '7 days'`);
+  const r = await pool.query(`delete from sendgrid_events where event_ts < now() - interval '30 days'`);
   return r.rowCount || 0;
 }
 
