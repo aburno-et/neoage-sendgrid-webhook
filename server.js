@@ -513,7 +513,11 @@ async function hydrateOneMessage(account, sgMessageId) {
       status: detail?.status || null,
       sending_domain: sendingDomain,
       stream: ca.stream || null,
-      campaign: ca.clickupid || ca.campaign || null,
+      campaign: (() => {
+  const val = ca.clickupid || ca.campaign || null;
+  console.log(`[Campaign Debug] clickupid=${ca.clickupid} campaign=${ca.campaign} resolved=${val}`);
+  return val;
+})(),
       ip_pool: ca.ip_pool || null,
       environment: ca.environment || null,
       country,
