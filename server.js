@@ -430,7 +430,7 @@ async function upsertEventRow(client, row) {
     event_key, sg_account, sg_event_id, sg_message_id,
     event_ts, event, ip, email, recipient_domain,
     reason, response, status,
-    sending_domain, stream, campaign, ip_pool, environment,
+    sending_domain, stream, campaign, clickup_id, ip_pool, environment,
     country, utm_source, email_type, project,
   } = row;
 
@@ -441,13 +441,13 @@ async function upsertEventRow(client, row) {
       sg_account, sg_event_id, sg_message_id,
       event_ts, event, ip, email, recipient_domain,
       reason, response, status,
-      sending_domain, stream, campaign, ip_pool, environment,
+      sending_domain, stream, campaign, clickup_id, ip_pool, environment,
       country, utm_source, email_type, project
     )
     values (
       $1, $2, $3, $4, $5, $6, $7, $8, $9,
-      $10, $11, $12, $13, $14, $15, $16, $17,
-      $18, $19, $20, $21
+      $10, $11, $12, $13, $14, $15, $16, $17, $18,
+      $19, $20, $21, $22
     )
     on conflict (event_key) do update set
       sg_event_id    = excluded.sg_event_id,
@@ -459,6 +459,7 @@ async function upsertEventRow(client, row) {
       sending_domain = excluded.sending_domain,
       stream         = excluded.stream,
       campaign       = excluded.campaign,
+      clickup_id     = excluded.clickup_id,
       ip_pool        = excluded.ip_pool,
       environment    = excluded.environment,
       country        = excluded.country,
@@ -470,11 +471,12 @@ async function upsertEventRow(client, row) {
       event_key, sg_account, sg_event_id, sg_message_id,
       event_ts, event, ip, email, recipient_domain,
       reason, response, status,
-      sending_domain, stream, campaign, ip_pool, environment,
+      sending_domain, stream, campaign, clickup_id, ip_pool, environment,
       country, utm_source, email_type, project,
     ]
   );
 }
+
 
 async function hydrateOneMessage(account, sgMessageId) {
   const detail = await sgFetch(account, "GET", `/v3/logs/${encodeURIComponent(sgMessageId)}`);
@@ -513,11 +515,8 @@ async function hydrateOneMessage(account, sgMessageId) {
       status: detail?.status || null,
       sending_domain: sendingDomain,
       stream: ca.stream || null,
-      campaign: (() => {
-  const val = ca.clickupid || ca.campaign || null;
-  console.log(`[Campaign Debug] clickupid=${ca.clickupid} campaign=${ca.campaign} resolved=${val}`);
-  return val;
-})(),
+      campaign: ca.campaign || null,
+clickup_id: ca.clickupid || null,
       ip_pool: ca.ip_pool || null,
       environment: ca.environment || null,
       country,
@@ -555,7 +554,8 @@ async function hydrateOneMessage(account, sgMessageId) {
       status: ev?.status || detail?.status || null,
       sending_domain: sendingDomain,
       stream: ca.stream || evCa.stream || null,
-      campaign: evCa.clickupid || ca.clickupid || evCa.campaign || ca.campaign || null,
+      campaign: evCa.campaign || ca.campaign || null,
+clickup_id: evCa.clickupid || ca.clickupid || null,
       ip_pool: ca.ip_pool || evCa.ip_pool || null,
       environment: ca.environment || evCa.environment || null,
       country: ca.country || evCa.country || null,
