@@ -171,30 +171,31 @@ async function upsertGptDay(domain, dayStr, item) {
 async function initDb() {
  await pool.query(`
     create table if not exists sendgrid_events (
-      id bigserial primary key,
-      received_at timestamptz not null default now(),
-      event_key text unique,
-      sg_account text,
-      sg_event_id text,
-      sg_message_id text,
-      event_ts timestamptz,
-      event text not null,
-      ip inet,
-      email text,
-      recipient_domain text,
-      reason text,
-      response text,
-      status text,
-      sending_domain text,
-      stream text,
-      campaign text,
-      ip_pool text,
-      environment text,
-      country text,
-      utm_source text,
-      email_type text,
-      project text
-    );
+  id bigserial primary key,
+  received_at timestamptz not null default now(),
+  event_key text unique,
+  sg_account text,
+  sg_event_id text,
+  sg_message_id text,
+  event_ts timestamptz,
+  event text not null,
+  ip inet,
+  email text,
+  recipient_domain text,
+  reason text,
+  response text,
+  status text,
+  sending_domain text,
+  stream text,
+  campaign text,
+  clickup_id text,
+  ip_pool text,
+  environment text,
+  country text,
+  utm_source text,
+  email_type text,
+  project text
+);
   `);
 
   await pool.query(`create index if not exists idx_sge_event_ts on sendgrid_events (event_ts desc);`);
