@@ -679,9 +679,8 @@ async function processWindowRecursive(account, sinceDt, untilDt, anchorMs) {
   const until = new Date(untilDt);
   const windowMs = until.getTime() - since.getTime();
 
-  const search = await hydrateAndStore(account, search.ids, search.clickupByMessageId);
+  const search = await sgSearchMessageIds(account, since, until, anchorMs);
 
-  // If we hit the ceiling, split. If we can't split further, DO NOT hydrate (reliability first).
   if (search.count >= SG_LOGS_LIMIT) {
     if (windowMs <= MIN_WINDOW_MS) {
       console.warn(
@@ -712,8 +711,13 @@ async function processWindowRecursive(account, sinceDt, untilDt, anchorMs) {
     };
   }
 
-  // Below ceiling: hydrate
-  const store = await hydrateAndStore(account, search.ids, null);
+  const store = await hydrateAndStore(
+    account,
+    search.ids,
+    search.clickupByMessageId || new Map(),
+    null
+  );
+
   return { foundMessages: search.count, ...store, capped: false, suggestedAdvanceTo: null };
 }
 
