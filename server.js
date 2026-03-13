@@ -403,13 +403,11 @@ async function sgSearchMessageIds(account, sinceDt, untilDt, anchorMs) {
   const since = clampRollingFloor(sinceDt, anchorMs);
   const until = new Date(untilDt);
 
-  const sinceStr = isoNoMs(since);
-  const untilStr = isoNoMs(until);
+  const sinceStr = fmtDateSecond(since);
+  const untilStr = fmtDateSecond(until);
 
   const body = {
-    query:
-      `sg_message_id_created_at > TIMESTAMP "${sinceStr}" ` +
-      `AND sg_message_id_created_at <= TIMESTAMP "${untilStr}"`,
+    query: `last_event_time BETWEEN TIMESTAMP "${sinceStr}" AND TIMESTAMP "${untilStr}"`,
     limit: SG_LOGS_LIMIT,
   };
 
@@ -417,12 +415,20 @@ async function sgSearchMessageIds(account, sinceDt, untilDt, anchorMs) {
 
   const messages = search?.result || search?.results || search?.messages || [];
   const ids = [];
+  const clickupByMessageId = new Map();
+
   for (const m of messages) {
     const id = m.sg_message_id || m.message_id || m.sg_message_id_string;
-    if (id) ids.push(id);
+    if (!id) continue;
+
+    ids.push(id);
+
+    const ca = m.custom_args || m.unique_args || {};
+    const clickupId = ca.clickupid || null;
+    if (clickupId) clickupByMessageId.set(id, clickupId);
   }
 
-  return { ids, count: ids.length, sinceStr, untilStr };
+  return { ids, count: ids.length, sinceStr, untilStr, clickupByMessageId };
 }
 
 // -------------------- Hydrate + upsert --------------------
@@ -479,7 +485,7 @@ async function upsertEventRow(client, row) {
 }
 
 
-async function hydrateOneMessage(account, sgMessageId) {
+async function hydrateOneMessage(account, sgMessageId, fallbackClickupId = null) {
   const detail = await sgFetch(account, "GET", `/v3/logs/${encodeURIComponent(sgMessageId)}`);
 
 
@@ -544,7 +550,7 @@ console.log("[clickup debug]", JSON.stringify({
       sending_domain: sendingDomain,
       stream: ca.stream || null,
       campaign: ca.campaign || null,
-clickup_id: ca.clickupid || null,
+clickup_id: ca.clickupid || fallbackClickupId || null,
       ip_pool: ca.ip_pool || null,
       environment: ca.environment || null,
       country,
@@ -583,7 +589,7 @@ clickup_id: ca.clickupid || null,
       sending_domain: sendingDomain,
       stream: ca.stream || evCa.stream || null,
       campaign: evCa.campaign || ca.campaign || null,
-clickup_id: evCa.clickupid || ca.clickupid || null,
+clickup_id: evCa.clickupid || ca.clickupid || fallbackClickupId || null,
       ip_pool: ca.ip_pool || evCa.ip_pool || null,
       environment: ca.environment || evCa.environment || null,
       country: ca.country || evCa.country || null,
@@ -596,7 +602,7 @@ clickup_id: evCa.clickupid || ca.clickupid || null,
   return out;
 }
 
-async function hydrateAndStore(account, sgMessageIds, progressCb) {
+async function hydrateAndStore(account, sgMessageIds, clickupByMessageId = new Map(), progressCb) {
   let hydrated = 0;
   let inserted = 0;
 
@@ -639,7 +645,11 @@ async function hydrateAndStore(account, sgMessageIds, progressCb) {
         const sgMessageId = sgMessageIds[myIdx];
         hydrated += 1;
 
-        const rows = await hydrateOneMessage(account, sgMessageId);
+        const rows = await hydrateOneMessage(
+  account,
+  sgMessageId,
+  clickupByMessageId.get(sgMessageId) || null
+);
         for (const row of rows) queue.push(row);
 
         if (PER_REQUEST_DELAY_MS) await sleep(PER_REQUEST_DELAY_MS);
@@ -669,7 +679,7 @@ async function processWindowRecursive(account, sinceDt, untilDt, anchorMs) {
   const until = new Date(untilDt);
   const windowMs = until.getTime() - since.getTime();
 
-  const search = await sgSearchMessageIds(account, since, until, anchorMs);
+  const search = await hydrateAndStore(account, search.ids, search.clickupByMessageId);
 
   // If we hit the ceiling, split. If we can't split further, DO NOT hydrate (reliability first).
   if (search.count >= SG_LOGS_LIMIT) {
