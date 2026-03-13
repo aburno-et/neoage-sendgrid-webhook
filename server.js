@@ -482,6 +482,33 @@ async function upsertEventRow(client, row) {
 async function hydrateOneMessage(account, sgMessageId) {
   const detail = await sgFetch(account, "GET", `/v3/logs/${encodeURIComponent(sgMessageId)}`);
 
+
+const events = detail?.events || detail?.event || detail?.items || detail?.results || [];
+const normalizedEvents = Array.isArray(events) ? events : [events];
+const ca = detail?.custom_args || detail?.unique_args || {};
+
+console.log("[clickup debug]", JSON.stringify({
+  sgMessageId,
+  topLevelKeys: Object.keys(ca || {}),
+  topLevelClickupid: ca?.clickupid ?? null,
+  topLevelClickupId: ca?.clickup_id ?? null,
+  topLevelClickupCamel: ca?.clickupId ?? null,
+  eventKeys: normalizedEvents.map((ev, i) => {
+    const evCa = ev?.custom_args || ev?.unique_args || {};
+    return {
+      i,
+      event: ev?.event || ev?.type || ev?.name || null,
+      keys: Object.keys(evCa || {}),
+      clickupid: evCa?.clickupid ?? null,
+      clickup_id: evCa?.clickup_id ?? null,
+      clickupId: evCa?.clickupId ?? null
+    };
+  })
+}, null, 2));
+
+
+
+
   const events = detail?.events || detail?.event || detail?.items || detail?.results || [];
   const normalizedEvents = Array.isArray(events) ? events : [events];
 
