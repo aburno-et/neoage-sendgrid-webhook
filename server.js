@@ -407,13 +407,15 @@ async function sgSearchMessageIds(account, sinceDt, untilDt, anchorMs) {
   const since = clampRollingFloor(sinceDt, anchorMs);
   const until = new Date(untilDt);
 
-  const sinceStr = fmtDateSecond(since);
-  const untilStr = fmtDateSecond(until);
+ const sinceStr = isoNoMs(since);
+const untilStr = isoNoMs(until);
 
-  const body = {
-    query: `last_event_time BETWEEN TIMESTAMP "${sinceStr}" AND TIMESTAMP "${untilStr}"`,
-    limit: SG_LOGS_LIMIT,
-  };
+const body = {
+  query:
+    `sg_message_id_created_at > TIMESTAMP "${sinceStr}" ` +
+    `AND sg_message_id_created_at <= TIMESTAMP "${untilStr}"`,
+  limit: SG_LOGS_LIMIT,
+};
 
   const search = await sgFetch(account, "POST", "/v3/logs", body);
 
