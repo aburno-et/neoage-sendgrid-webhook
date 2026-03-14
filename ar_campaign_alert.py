@@ -11,12 +11,6 @@ Requirements:
 Environment variables (set in Render / your cron environment):
     DATABASE_URL   — Render PostgreSQL connection string
     SLACK_WEBHOOK  — Slack Incoming Webhook URL
-
-Thresholds (edit below if needed):
-    MIN_SENDS        = 1000     minimum recipients to trigger evaluation
-    MIN_DELIVERY_PCT = 98.0    delivery rate must be >= this
-    MIN_OPEN_PCT     = 50.0    open rate must be >= this
-    MAX_SPAM_PCT     = 0.1     spam rate must be <= this
 """
 
 import os
@@ -27,25 +21,22 @@ import psycopg2
 import psycopg2.extras
 import requests
 
-# ── Thresholds ─────────────────────────────────────────────────────────────────
 MIN_SENDS        = 1000
 MIN_DELIVERY_PCT = 98.0
 MIN_OPEN_PCT     = 50.0
 MAX_SPAM_PCT     = 0.1
 
-# ── Config from environment ────────────────────────────────────────────────────
 DATABASE_URL  = os.environ["DATABASE_URL"]
 SLACK_WEBHOOK = os.environ["SLACK_WEBHOOK"]
 
-# ── SQL ────────────────────────────────────────────────────────────────────────
-# Aggregates yesterday's events for AR, one row per campaign.
-# Only campaigns with sends > MIN_SENDS are evaluated.
 QUERY = """
 WITH yesterday AS (
     SELECT
         campaign,
         project,
         email_type,
+        STRING_AGG(DISTINCT clickup_id, ', ' ORDER BY clickup_id)
+            FILTER (WHERE clickup_id IS NOT NULL AND clickup_id <> '') AS clickup_ids,
         COUNT(*) FILTER (WHERE event = 'processed')   AS sends,
         COUNT(*) FILTER (WHERE event = 'delivered')   AS delivered,
         COUNT(*) FILTER (WHERE event = 'open')        AS opened,
@@ -62,6 +53,7 @@ SELECT
     campaign,
     project,
     email_type,
+    clickup_ids,
     sends,
     delivered,
     opened,
@@ -76,7 +68,6 @@ ORDER BY sends DESC;
 
 
 def check_thresholds(row: dict) -> list[str]:
-    """Return a list of human-readable breach descriptions, empty if all OK."""
     breaches = []
     if row["delivery_pct"] is not None and row["delivery_pct"] < MIN_DELIVERY_PCT:
         breaches.append(
@@ -97,14 +88,16 @@ def check_thresholds(row: dict) -> list[str]:
 
 
 def build_slack_block(row: dict, breaches: list[str], report_date: date) -> dict:
-    """Build a single Slack Block Kit section for one breaching campaign."""
     breach_text = "\n".join(f"  • {b}" for b in breaches)
+    clickup_text = row["clickup_ids"] or "—"
+
     return {
         "type": "section",
         "text": {
             "type": "mrkdwn",
             "text": (
                 f"*Campaign:* `{row['campaign']}`\n"
+                f"*ClickUp ID:* `{clickup_text}`\n"
                 f"*Project:* {row['project'] or '—'}  |  *Email Type:* {row['email_type'] or '—'}\n"
                 f"*Date:* {report_date}  |  *Country:* ar  |  "
                 f"*Sends:* {row['sends']:,}\n"
@@ -115,7 +108,6 @@ def build_slack_block(row: dict, breaches: list[str], report_date: date) -> dict
 
 
 def send_slack_alert(alerts: list[dict], report_date: date) -> None:
-    """Post a Slack message listing all breaching campaigns."""
     blocks = [
         {
             "type": "header",
@@ -173,9 +165,16 @@ def main() -> None:
         breaches = check_thresholds(row)
         if breaches:
             alerts.append({"row": row, "breaches": breaches})
-            print(f"  ✗ BREACH  — {row['campaign']} ({len(breaches)} issue(s))")
+            print(
+                f"  ✗ BREACH  — {row['campaign']} "
+                f"(ClickUp: {row['clickup_ids'] or '—'}) "
+                f"({len(breaches)} issue(s))"
+            )
         else:
-            print(f"  ✓ OK      — {row['campaign']}")
+            print(
+                f"  ✓ OK      — {row['campaign']} "
+                f"(ClickUp: {row['clickup_ids'] or '—'})"
+            )
 
     if alerts:
         send_slack_alert(alerts, report_date)
