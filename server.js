@@ -1113,7 +1113,7 @@ app.post("/admin/gpt/pull", async (req, res) => {
   }
 });
 
-
+console.log("SERVER BUILD MARKER: clickup-debug-v1");
 
 // -------------------- Start --------------------
 app.listen(PORT, "0.0.0.0", () => {
