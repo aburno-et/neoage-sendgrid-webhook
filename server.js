@@ -498,25 +498,7 @@ async function hydrateOneMessage(account, sgMessageId, fallbackClickupId = null)
   const normalizedEvents = Array.isArray(events) ? events : [events];
   const ca = detail?.custom_args || detail?.unique_args || {};
 
-  console.log("[clickup debug]", JSON.stringify({
-    sgMessageId,
-    topLevelKeys: Object.keys(ca || {}),
-    topLevelClickupid: ca?.clickupid ?? null,
-    topLevelClickupId: ca?.clickup_id ?? null,
-    topLevelClickupCamel: ca?.clickupId ?? null,
-    eventKeys: normalizedEvents.map((ev, i) => {
-      const evCa = ev?.custom_args || ev?.unique_args || {};
-      return {
-        i,
-        event: ev?.event || ev?.type || ev?.name || null,
-        keys: Object.keys(evCa || {}),
-        clickupid: evCa?.clickupid ?? null,
-        clickup_id: evCa?.clickup_id ?? null,
-        clickupId: evCa?.clickupId ?? null
-      };
-    })
-  }, null, 2));
-
+ 
   const email = detail?.to_email || detail?.email || detail?.recipient || detail?.to || null;
   const recipientDomain =
     typeof email === "string" && email.includes("@") ? email.split("@").pop().toLowerCase() : null;
@@ -641,11 +623,6 @@ async function hydrateAndStore(account, sgMessageIds, clickupByMessageId = new M
         hydrated += 1;
 
 const fallback = clickupByMessageId.get(sgMessageId) || null;
-console.log("[clickup map lookup]", JSON.stringify({
-  sgMessageId,
-  hasFallback: !!fallback,
-  fallback
-}, null, 2));
 
 const rows = await hydrateOneMessage(account, sgMessageId, fallback);
 
