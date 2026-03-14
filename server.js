@@ -281,6 +281,10 @@ function isoNoMs(dt) {
   return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
+function fmtDateSecond(dt) {
+  return new Date(dt).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 function clampRollingFloor(dt, anchorMs) {
   const floor = new Date(anchorMs - ROLLING_WINDOW_MS);
   return dt < floor ? floor : dt;
@@ -488,47 +492,37 @@ async function upsertEventRow(client, row) {
 async function hydrateOneMessage(account, sgMessageId, fallbackClickupId = null) {
   const detail = await sgFetch(account, "GET", `/v3/logs/${encodeURIComponent(sgMessageId)}`);
 
-
-const events = detail?.events || detail?.event || detail?.items || detail?.results || [];
-const normalizedEvents = Array.isArray(events) ? events : [events];
-const ca = detail?.custom_args || detail?.unique_args || {};
-
-console.log("[clickup debug]", JSON.stringify({
-  sgMessageId,
-  topLevelKeys: Object.keys(ca || {}),
-  topLevelClickupid: ca?.clickupid ?? null,
-  topLevelClickupId: ca?.clickup_id ?? null,
-  topLevelClickupCamel: ca?.clickupId ?? null,
-  eventKeys: normalizedEvents.map((ev, i) => {
-    const evCa = ev?.custom_args || ev?.unique_args || {};
-    return {
-      i,
-      event: ev?.event || ev?.type || ev?.name || null,
-      keys: Object.keys(evCa || {}),
-      clickupid: evCa?.clickupid ?? null,
-      clickup_id: evCa?.clickup_id ?? null,
-      clickupId: evCa?.clickupId ?? null
-    };
-  })
-}, null, 2));
-
-
-
-
   const events = detail?.events || detail?.event || detail?.items || detail?.results || [];
   const normalizedEvents = Array.isArray(events) ? events : [events];
+  const ca = detail?.custom_args || detail?.unique_args || {};
+
+  console.log("[clickup debug]", JSON.stringify({
+    sgMessageId,
+    topLevelKeys: Object.keys(ca || {}),
+    topLevelClickupid: ca?.clickupid ?? null,
+    topLevelClickupId: ca?.clickup_id ?? null,
+    topLevelClickupCamel: ca?.clickupId ?? null,
+    eventKeys: normalizedEvents.map((ev, i) => {
+      const evCa = ev?.custom_args || ev?.unique_args || {};
+      return {
+        i,
+        event: ev?.event || ev?.type || ev?.name || null,
+        keys: Object.keys(evCa || {}),
+        clickupid: evCa?.clickupid ?? null,
+        clickup_id: evCa?.clickup_id ?? null,
+        clickupId: evCa?.clickupId ?? null
+      };
+    })
+  }, null, 2));
 
   const email = detail?.to_email || detail?.email || detail?.recipient || detail?.to || null;
   const recipientDomain =
     typeof email === "string" && email.includes("@") ? email.split("@").pop().toLowerCase() : null;
 
- const ca = detail?.custom_args || detail?.unique_args || {};
-
-  // Extract all fields we need directly - no more raw storage
   const outboundIp = detail?.outbound_ip || null;
   const country = ca.country || null;
   const utmSource = ca.utm_source || null;
-  const emailType = ca.mail_type || ca.email_type || ca['emaiç_type'] || null; // handle upstream typo
+  const emailType = ca.mail_type || ca.email_type || ca["emaiç_type"] || null;
   const project = ca.project || null;
   const sendingDomain = detail?.from_email || ca.sending_domain || null;
 
@@ -550,7 +544,7 @@ console.log("[clickup debug]", JSON.stringify({
       sending_domain: sendingDomain,
       stream: ca.stream || null,
       campaign: ca.campaign || null,
-clickup_id: ca.clickupid || fallbackClickupId || null,
+      clickup_id: ca.clickupid || fallbackClickupId || null,
       ip_pool: ca.ip_pool || null,
       environment: ca.environment || null,
       country,
@@ -589,19 +583,18 @@ clickup_id: ca.clickupid || fallbackClickupId || null,
       sending_domain: sendingDomain,
       stream: ca.stream || evCa.stream || null,
       campaign: evCa.campaign || ca.campaign || null,
-clickup_id: evCa.clickupid || ca.clickupid || fallbackClickupId || null,
+      clickup_id: evCa.clickupid || ca.clickupid || fallbackClickupId || null,
       ip_pool: ca.ip_pool || evCa.ip_pool || null,
       environment: ca.environment || evCa.environment || null,
       country: ca.country || evCa.country || null,
       utm_source: ca.utm_source || evCa.utm_source || null,
-      email_type: evCa.mail_type || ca.mail_type || evCa.email_type || ca.email_type || ca['emaiç_type'] || null,
+      email_type: evCa.mail_type || ca.mail_type || evCa.email_type || ca.email_type || ca["emaiç_type"] || null,
       project: ca.project || evCa.project || null,
     });
   }
 
   return out;
 }
-
 async function hydrateAndStore(account, sgMessageIds, clickupByMessageId = new Map(), progressCb) {
   let hydrated = 0;
   let inserted = 0;
@@ -645,12 +638,16 @@ async function hydrateAndStore(account, sgMessageIds, clickupByMessageId = new M
         const sgMessageId = sgMessageIds[myIdx];
         hydrated += 1;
 
-        const rows = await hydrateOneMessage(
-  account,
+const fallback = clickupByMessageId.get(sgMessageId) || null;
+console.log("[clickup map lookup]", JSON.stringify({
   sgMessageId,
-  clickupByMessageId.get(sgMessageId) || null
-);
-        for (const row of rows) queue.push(row);
+  hasFallback: !!fallback,
+  fallback
+}, null, 2));
+
+const rows = await hydrateOneMessage(account, sgMessageId, fallback);
+
+              for (const row of rows) queue.push(row);
 
         if (PER_REQUEST_DELAY_MS) await sleep(PER_REQUEST_DELAY_MS);
 
